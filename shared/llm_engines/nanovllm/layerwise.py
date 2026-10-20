@@ -5,8 +5,21 @@ The sequence loop stays in Python for CPU experts. MMGP graphs each GPU segment,
 and owns all weight placement. Reuse the same attention/DeltaNet kernels as the
 ordinary nano-vLLM runner; legacy/cg use PyTorch without Triton or FlashAttention.
 """
+from functools import cache
+
 import torch
 from shared.attention import pay_attention
+
+
+@cache
+def _fast_attention_supported(device):
+    if device.type != "cuda":
+        return False
+    # FLA's BF16 kernels and FlashAttention 2 need Ampere on NVIDIA. Keep HIP's existing path.
+    if torch.version.hip is None and torch.cuda.get_device_capability(device) < (8, 0):
+        print("[LM] Keeping vLLM with PyTorch DeltaNet and SDPA attention: this GPU does not support the FLA/FlashAttention 2 kernels.")
+        return False
+    return True
 
 
 def cached_attention(qkv, group, cache, positions, kv_len, engine, *, triton_cache=False):
@@ -17,7 +30,8 @@ def cached_attention(qkv, group, cache, positions, kv_len, engine, *, triton_cac
     heads = stop - start
     groups = query.shape[2] // heads
     key, value = key[:, :, ::groups], value[:, :, ::groups]
-    if engine == "vllm" and triton_cache and start == 0 and stop == key_cache.shape[2]:
+    fast_attention = engine == "vllm" and _fast_attention_supported(query.device)
+    if fast_attention and triton_cache and start == 0 and stop == key_cache.shape[2]:
         from .layers.attention import store_kvcache
         slots = positions[None, :] + torch.arange(query.shape[0], device=positions.device)[:, None] * key_cache.shape[1]
         store_kvcache(key.contiguous().flatten(0, 1), value.contiguous().flatten(0, 1), key_cache, value_cache,
@@ -25,7 +39,7 @@ def cached_attention(qkv, group, cache, positions, kv_len, engine, *, triton_cac
     else:
         key_cache[:, :, start:stop].index_copy_(1, positions, key)
         value_cache[:, :, start:stop].index_copy_(1, positions, value)
-    if engine == "vllm":
+    if fast_attention:
         from .layers.attention import _DEFAULT_FLASH_ATTN_WITH_KVCACHE
         if _DEFAULT_FLASH_ATTN_WITH_KVCACHE is None:
             raise RuntimeError("The vLLM layerwise decoder requires FlashAttention 2")
@@ -42,7 +56,7 @@ def cached_attention(qkv, group, cache, positions, kv_len, engine, *, triton_cac
 
 
 def delta_rule(query, key, value, decay, beta, initial_state, *, engine, recurrent, torch_impl):
-    if engine == "vllm":
+    if engine == "vllm" and _fast_attention_supported(query.device):
         from .models.qwen3_5 import (_DEFAULT_FAST_RECURRENT_GATED_DELTA_RULE, _DEFAULT_FAST_CHUNK_GATED_DELTA_RULE,
                                     configure_qwen35_fla_prefill_autotune)
         configure_qwen35_fla_prefill_autotune(query.device)

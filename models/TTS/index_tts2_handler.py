@@ -373,7 +373,7 @@ class family_handler:
             "pipe": pipe,
             "coTenantsMap": {},
         }
-        if int(profile) in (2, 4, 5):
+        if int(profile) in (0, 2, 4, 5):
             load_def["budgets"] = {"transformer2": 250}
 
         if save_quantized and gpt_weights_path:

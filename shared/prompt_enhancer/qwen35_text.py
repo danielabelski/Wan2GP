@@ -9,9 +9,11 @@ import sys
 import types
 from collections import OrderedDict
 
+import numpy as np
 import torch
 from mmgp import offload
 from tqdm.auto import tqdm
+from shared.kernels.dispatch import triton_dtype_supported
 
 from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io
 from shared.deepy.config import DEEPY_REPETITION_PENALTY_DEFAULT, DEEPY_REPETITION_PENALTY_KEY, get_deepy_config_value, normalize_deepy_repetition_penalty
@@ -20,10 +22,7 @@ from shared.llm_engines.nanovllm import SamplingParams
 from shared.llm_engines.nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM, clear_qwen35_runtime_caches
 from shared.llm_engines.nanovllm.layers.attention import reset_attention_backend_logs
 from shared.llm_engines.nanovllm.utils.context import reset_context
-from shared.llm_engines.nanovllm.vllm_support import (
-    NanoVllmTextEngine,
-    resolve_lm_decoder_engine,
-)
+from shared.llm_engines.nanovllm.vllm_support import NanoVllmTextEngine, probe_vllm_runtime
 from shared.qtypes.gguf import GGUFFirstRowsLinear, GGUFWeightTensor, materialize_module_source_tensors
 try:
     from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
@@ -46,10 +45,15 @@ from .qwen35_vl import (
 )
 
 
-QWEN35_TEXT_VLLM_SWITCH_ENV = "WGP_QWEN35_PROMPT_ENHANCER_VLLM"
-QWEN35_TEXT_VLLM_CUDAGRAPH_ENV = "WGP_QWEN35_PROMPT_ENHANCER_VLLM_CUDAGRAPH"
-# Debug switch: keep vLLM kernels active while forcing eager execution.
-QWEN35_TEXT_VLLM_DISABLE_CUDAGRAPH = False #True
+# Debug only: comma-separated features the LLM engine must not use (graphs, triton, flash), e.g. WGP_LLM_DISABLE=graphs to compare with eager runs
+QWEN35_LLM_DISABLE_ENV = "WGP_LLM_DISABLE"
+QWEN35_LLM_PLANNED_CONTEXT = 32768  # tokens of KV cache planned beside the LLM's weights (MMGP cpuCompute pinning share)
+QWEN35_LLM_MAX_PRELOAD_MB = 0  # tests of partial residency: most VRAM the LLM's weights may keep (base, blocks, slots of the streamed ones); 0: all that fit
+
+QWEN35_LLM_MAX_PRELOAD_MB = 8000
+QWEN35_LLM_CPU_COMPUTE = True
+QWEN35_LLM_SMART_PINNING = 2
+
 QWEN35_GGUF_LLAMACPP_ENV = "WGP_GGUF_LLAMACPP_CUDA"
 QWEN35_PROMPT_MIN_NEW_TOKENS = 4
 QWEN35_PROMPT_MIN_MODEL_LEN = 8000
@@ -624,44 +628,60 @@ def _resolve_prompt_min_p(model):
     return min_p if min_p > 0.0 else None
 
 
-def _resolve_prompt_enhancer_engine(backend: str, requested_lm_engine: str, runtime_model_path: str | None):
-    del backend
-    if runtime_model_path is None:
-        return "legacy", "vllm runtime path is not configured", False, False
-    if not _env_enabled(QWEN35_TEXT_VLLM_SWITCH_ENV, default=True):
-        return "legacy", f"disabled by {QWEN35_TEXT_VLLM_SWITCH_ENV}", False, False
-    requested_lm_engine = str(requested_lm_engine or "").strip().lower()
-    requested_label = requested_lm_engine or "auto"
-    resolved_engine = resolve_lm_decoder_engine(requested_lm_engine, ["cg", "vllm"], require_flash_attention=False)
-    enable_cudagraph = _env_enabled(QWEN35_TEXT_VLLM_CUDAGRAPH_ENV, default=True)
+def _resolve_llm_features(backend: str) -> dict:
+    """What the LLM engine uses, from the hardware and the packages installed: CUDA graphs (MMGP's, the weights stay under its management),
+    the Triton kernels (fused norms, activations, cache writes, GDN, sampling), FlashAttention 2 and the GGUF CUDA kernels."""
+    disabled = {name.strip() for name in os.environ.get(QWEN35_LLM_DISABLE_ENV, "").lower().split(",") if name.strip()}
+    cuda = torch.cuda.is_available() and not _is_mps_available()
+    checks = probe_vllm_runtime()["checks"] if cuda else {}
+    def check(name, flag):
+        if not cuda:
+            return False, "no CUDA GPU"
+        if flag in disabled:
+            return False, f"disabled by {QWEN35_LLM_DISABLE_ENV}"
+        return checks[name]["ok"], checks[name]["message"]
+    triton_ok, triton_reason = check("triton", "triton")
+    flash_ok, flash_reason = check("flash_attention_2", "flash")
+    if flash_ok and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0):
+        flash_ok, flash_reason = False, "requires an NVIDIA Ampere GPU or newer"
+    if backend == enhancer_quantization_GGUF:
+        from shared.qtypes.gguf import _gguf_cuda_module
+        native = _gguf_cuda_module()
+        gguf_ok, gguf_reason = native is not None, "ok" if native is not None else ("disabled by " + QWEN35_GGUF_LLAMACPP_ENV if not _env_enabled(QWEN35_GGUF_LLAMACPP_ENV) else "not installed")
+    else:
+        gguf_ok, gguf_reason = False, "not a GGUF checkpoint"
+    graphs_ok = cuda and "graphs" not in disabled
+    return dict(cuda=cuda, graphs=graphs_ok, triton=triton_ok, triton_reason=triton_reason, flash=flash_ok, flash_reason=flash_reason, gguf=gguf_ok, gguf_reason=gguf_reason,
+                gguf_version=getattr(native, "__version__", "") if gguf_ok else "", engine="vllm" if triton_ok else ("cg" if graphs_ok else "legacy"))
 
-    if resolved_engine == "legacy":
-        detail = f"lm_decoder_engine={requested_label}"
-        if requested_lm_engine in ("", "cg", "vllm"):
-            detail = f"lm_decoder_engine={requested_label} -> legacy"
-        return "legacy", detail, False, False
 
-    if resolved_engine == "cg":
-        detail = "cuda graph only" if enable_cudagraph else f"eager only; disabled by {QWEN35_TEXT_VLLM_CUDAGRAPH_ENV}"
-        if requested_lm_engine != "cg":
-            detail = f"lm_decoder_engine={requested_label} -> cg" #; {detail}"
-        return "cg", detail, enable_cudagraph, False
+def _qwen35_preload_workload(args, kwargs) -> str:
+    """The two workloads of the dynamic preload (block arguments: [hidden states, residual], ...): the decoding passes (a token, or a
+    speculative verification of a few) and the prompt chunks, whose activations take more VRAM; each keeps its own measure."""
+    hidden_states = args[0][0]
+    return "decode" if hidden_states.shape[-2] <= 64 else "prefill"
 
-    enable_cudagraph = enable_cudagraph and not QWEN35_TEXT_VLLM_DISABLE_CUDAGRAPH
-    detail = "cuda graph + vllm kernels" if enable_cudagraph else "eager + vllm kernels"
-    if requested_lm_engine == "":
-        detail = f"lm_decoder_engine=auto -> vllm" #; {detail}"
-    return "vllm", detail, enable_cudagraph, True
+
+def _describe_llm_features(features: dict, kv_cache_int8: bool, speculative: str) -> str:
+    def item(name, used, reason=""):
+        return name if used else f"no {name} ({reason})"
+    parts = [item("CUDA graphs", features["graphs"], "no CUDA GPU" if not features["cuda"] else f"disabled by {QWEN35_LLM_DISABLE_ENV}"),
+             item("Triton fused kernels", features["triton"], features["triton_reason"])]
+    if kv_cache_int8:
+        parts.append("INT8 KV cache" + (" (Triton paged attention)" if features["triton"] else " (dequantized attention)"))
+    else:
+        parts.append(item("FlashAttention 2", features["flash"], features["flash_reason"]))
+    if features["gguf"]:
+        parts.append(f"GGUF CUDA kernels {features['gguf_version']}".rstrip())
+    elif features["gguf_reason"] != "not a GGUF checkpoint":
+        parts.append(f"no GGUF CUDA kernels ({features['gguf_reason']})")
+    if speculative:
+        parts.append(speculative)
+    return ", ".join(parts)
 
 
 def _use_vllm_prompt_enhancer(model) -> bool:
-    if not bool(getattr(model, "_prompt_enhancer_use_vllm", False)):
-        return False
-    if not _env_enabled(QWEN35_TEXT_VLLM_SWITCH_ENV, default=True):
-        return False
-    if not torch.cuda.is_available():
-        return False
-    return True
+    return bool(getattr(model, "_prompt_enhancer_use_vllm", False)) and torch.cuda.is_available()
 
 
 def _use_legacy_cuda_runner_prompt_enhancer(model) -> bool:
@@ -929,9 +949,14 @@ def _load_local_text_model(
     modules=None,
     postprocess_sd=None,
     preserve_native_dtypes=False,
+    flash_attention=None,
 ):
     config = _load_text_config(config_path)
     config._prompt_enhancer_safe_legacy = bool(safe_legacy_mode)
+    config._prompt_enhancer_safe_fused_kernels = (torch.cuda.is_available()
+        and not triton_dtype_supported(torch.device("cuda", torch.cuda.current_device()), torch.bfloat16))
+    if flash_attention is not None:
+        config._prompt_enhancer_flash_attention = bool(flash_attention)
     config._prompt_enhancer_enable_mtp_speculative = bool(enable_mtp)
     with torch.device("meta"):
         model = Qwen3_5ForCausalLM(config)
@@ -996,6 +1021,26 @@ def _configure_qwen35_text_model(
         model.config.torch_dtype = model_dtype
 
 
+class _RowsSpan:
+    # the memory of tensors that lie one after the other, for numpy, which keeps this object as the base of its array: the tensors stay alive
+    def __init__(self, tensors, nbytes):
+        self.tensors = tensors
+        self.__array_interface__ = {"version": 3, "shape": (nbytes,), "typestr": "|u1", "data": (tensors[0].data_ptr(), False)}
+
+
+def _cat_rows(tensors):
+    # torch.cat along the rows, as a view when the tensors lie one after the other in memory (consecutive tensors of a checkpoint mapping,
+    # such as ffn_gate and ffn_up in GGUF files): the fused weight then stays in the checkpoint file instead of private RAM, which the system
+    # would write to the page file under memory pressure
+    end = tensors[0].data_ptr()
+    for tensor in tensors:
+        if tensor.device.type != "cpu" or not tensor.is_contiguous() or tensor.dtype != tensors[0].dtype or tensor.data_ptr() != end:
+            return torch.cat(tensors, dim=0)
+        end += tensor.numel() * tensor.element_size()
+    span = np.asarray(_RowsSpan(tensors, end - tensors[0].data_ptr()))
+    return torch.from_numpy(span).view(tensors[0].dtype).view(-1, *tensors[0].shape[1:])
+
+
 def _concat_linear_weights(weights):
     if len(weights) == 0:
         raise ValueError("At least one linear weight is required to build a fused projection.")
@@ -1010,7 +1055,7 @@ def _concat_linear_weights(weights):
             and int(weight.shape[1]) == int(first.shape[1])
             for weight in weights
         ):
-            raw = torch.cat([weight._data for weight in weights], dim=0)
+            raw = _cat_rows([weight._data for weight in weights])
             out_features = sum(int(weight.shape[0]) for weight in weights)
             in_features = int(first.shape[1])
             return GGUFWeightTensor.create(
@@ -1037,8 +1082,8 @@ def _concat_linear_weights(weights):
             and int(weight._scale.ndim) == scale_ndim
             for weight in weights
         ):
-            raw_data = torch.cat([weight._data for weight in weights], dim=0)
-            raw_scale = torch.cat([weight._scale for weight in weights], dim=0)
+            raw_data = _cat_rows([weight._data for weight in weights])
+            raw_scale = _cat_rows([weight._scale for weight in weights])
             out_features = sum(int(weight.shape[0]) for weight in weights)
             in_features = int(first.shape[1])
             return WeightQBytesTensor.create(
@@ -1051,13 +1096,13 @@ def _concat_linear_weights(weights):
                 activation_qtype=activation_qtype,
                 requires_grad=False,
             )
-    return torch.cat([weight.detach() for weight in weights], dim=0)
+    return _cat_rows([weight.detach() for weight in weights])
 
 
 def _concat_linear_biases(biases):
     if len(biases) == 0 or any(bias is None for bias in biases):
         return None
-    return torch.cat([bias.detach() for bias in biases], dim=0)
+    return _cat_rows([bias.detach() for bias in biases])
 
 
 def _build_fused_column_linear(modules):
@@ -1150,7 +1195,6 @@ def load_qwen35_text_prompt_enhancer(
     default_dtype: torch.dtype = torch.float16,
     backend: str = enhancer_quantization_QUANTO_INT8,
     attn_implementation: str = "sdpa",
-    requested_lm_engine: str = "",
     variant: str | None = None,
     speculative_decoding: bool = QWEN35_PROMPT_ENABLE_SPECULATIVE_DECODING,
     kv_cache_int8: bool = False,
@@ -1175,12 +1219,9 @@ def load_qwen35_text_prompt_enhancer(
         with open(chat_template_path, "r", encoding="utf-8") as reader:
             tokenizer.chat_template = reader.read()
 
-    engine_name, _engine_detail, enable_cudagraph, allow_vllm_kernels = _resolve_prompt_enhancer_engine(
-        backend=backend,
-        requested_lm_engine=requested_lm_engine,
-        runtime_model_path=text_assets_dir,
-    )
-    safe_legacy_mode = not allow_vllm_kernels
+    features = _resolve_llm_features(backend)  # the engine uses whatever the hardware and the installed packages allow
+    engine_name = features["engine"]
+    safe_legacy_mode = not features["triton"]
     prism_metadata = {}
     if backend == enhancer_quantization_GGUF:
         from shared.qtypes.prism import get_prism_metadata
@@ -1188,8 +1229,8 @@ def load_qwen35_text_prompt_enhancer(
         prism_metadata = get_prism_metadata(model_path)
     from .config import BLOCK_DRAFT_METHODS
     block_draft_method = speculative_decoding if speculative_decoding in BLOCK_DRAFT_METHODS else None
-    if block_draft_method is not None and (variant != "27b" or engine_name != "vllm"):
-        raise ValueError("DSpark and DFlash2 require Qwen3.8/Bonsai 27B with the vLLM decoder engine.")
+    if block_draft_method is not None and (variant != "27b" or not (features["triton"] and features["flash"])):
+        raise ValueError("DSpark and DFlash2 require Qwen3.8/Bonsai 27B, Triton and FlashAttention 2.")
     enable_mtp = bool(speculative_decoding and block_draft_method is None and spec.get("supports_mtp", False))
     q3_filename = spec.get("text_gguf_q3_filename")
     uses_separate_q3_mtp = backend == enhancer_quantization_GGUF and q3_filename and os.path.basename(str(model_path or "")).lower() == q3_filename.lower()
@@ -1245,6 +1286,7 @@ def load_qwen35_text_prompt_enhancer(
         modules=mtp_modules,
         postprocess_sd=postprocess_sd,
         preserve_native_dtypes=bool(prism_metadata),
+        flash_attention=features["flash"],
     )
     if backend == enhancer_quantization_QUANTO_INT8 and spec.get("text_int8_tie_word_embeddings", False):
         _tie_qwen35_output_to_embeddings(model)
@@ -1304,8 +1346,9 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_use_vllm = False
     model._prompt_enhancer_use_legacy_cuda_runner = False
     model._prompt_enhancer_engine_name = engine_name
-    model._prompt_enhancer_enable_cudagraph = bool(enable_cudagraph and engine_name in ("cg", "vllm"))
-    model._prompt_enhancer_allow_vllm_kernels = bool(allow_vllm_kernels)
+    model._prompt_enhancer_enable_cudagraph = features["graphs"]
+    model._prompt_enhancer_allow_vllm_kernels = features["triton"]
+    model._prompt_enhancer_llm_features = features
     model._prompt_enhancer_vllm_model_path = runtime_model_path
     model._prompt_enhancer_vllm_engine = None
     model._prompt_enhancer_vllm_mode = None
@@ -1322,12 +1365,28 @@ def load_qwen35_text_prompt_enhancer(
         install_block_draft(model, block_draft_method, engine_name, bonsai=bool(prism_metadata))
     model._prompt_enhancer_use_vllm = engine_name in ("cg", "vllm")
     model._prompt_enhancer_use_legacy_cuda_runner = engine_name == "legacy"
-    if model._prompt_enhancer_use_vllm or model._prompt_enhancer_use_legacy_cuda_runner:
-        model._budget = 0
+    # MMGP manages the weights: its graphs replay the decoding passes, its dynamic preload keeps in VRAM all the blocks that fit beside the
+    # KV cache and the activations (all of them at first: without its VRAM allocator, the budgets of the profile apply)
+    model._nanovllm_mmgp_graphs = features["graphs"]
+    from mmgp import allocator
+    if allocator.active == "vmm":
+        model._budget = 2 * os.path.getsize(model_path)  # beyond the model: every block preloaded
+    # MMGP cpuCompute (decoding computes the blocks out of VRAM on the CPU): what the runtime needs beside the weights, for its pinning share
+    config = model.config
+    layers = sum(layer_type == "full_attention" for layer_type in config.layer_types)
+    kv_bytes = layers * 2 * int(config.num_key_value_heads) * int(getattr(config, "head_dim", int(config.hidden_size) // int(config.num_attention_heads)))
+    model._mm_cpu_compute_reserve = kv_bytes * (1 if kv_cache_int8 else 2) * QWEN35_LLM_PLANNED_CONTEXT + (2 << 30)  # KV cache, activations, vision tower
+    if QWEN35_LLM_MAX_PRELOAD_MB:
+        model._budget = model._auto_preload_max = QWEN35_LLM_MAX_PRELOAD_MB << 20
+    model._mm_graph_keys = 32  # its decoding passes: one token, then 2 to 9 for the speculative verifications
+    model._mm_graph_placement_key = True  # only MMGP moves its weights: the key of a whole-model graph is checked in constant time
+    model._mm_graph_check_once = True  # its passes of any length read the same state: reads checked, cuBLAS use found, at the first capture
+    model._auto_preload_workload = _qwen35_preload_workload
+    for block in model.blk:
+        block._mm_graph_keys = 32
     reset_attention_backend_logs()
-    print(f"[Qwen3.5VL][{spec['display_name']}] Text generation engine: {engine_name}")
-    if enable_mtp:
-        print(f"[Qwen3.5VL][{spec['display_name']}] Native MTP speculative decoder: enabled")
+    speculative = f"{block_draft_method} drafts" if block_draft_method else ("native MTP" if enable_mtp else "")
+    print(f"[Qwen3.5VL][{spec['display_name']}] LLM engine: {_describe_llm_features(features, kv_cache_int8, speculative)}")
     model.generate_messages = types.MethodType(_generate_messages, model)
     model.unload = types.MethodType(_unload_prompt_enhancer_text_runtime, model)
     model._offload_hooks = ["forward"]

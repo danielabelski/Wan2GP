@@ -386,12 +386,14 @@ def probe_replay_verification(block, max_verify_tokens):
     Checked once per configuration, outside capture, with the verification's tensor layouts: the direct kernel must pass the
     numerical check of recurrent_raw_gates_checked against the established path, and replays must equal its snapshots exactly."""
     state = block.recurrent_state_buffer
-    if block.ssm_a.device != state.device or block.ssm_dt.device != state.device:
-        return False  # weights not resident yet: decided once the warm-up before graph capture has loaded them
     direct = getattr(block, "_gdn_direct_layout", True)
     layout = block._recurrence_layout(direct)
     projection = "qkv_gate" if block.attn_qkv_gate is not None else ("separate" if block.attn_gate_ab is None else "gate_ab")
     key = (state.device, state.dtype, int(max_verify_tokens), block.num_k_heads, block.head_k_dim, block.num_v_heads, block.head_v_dim, projection, tuple(layout.values()))
+    if key in _replay_choices:
+        return _replay_choices[key]  # decided on a layer of the same configuration, whether this one's weights are resident or streamed
+    if block.ssm_a.device != state.device or block.ssm_dt.device != state.device:
+        return False  # weights not resident yet: decided once the warm-up before graph capture has loaded them
     if key not in _replay_choices:
         _replay_choices[key] = _probe_replay(block, int(max_verify_tokens), direct, layout, projection)
         print(f"[Qwen][GDN] Speculative State Replay: {'Enabled' if _replay_choices[key] else 'Snapshots Kept'} (Numerical Check).")

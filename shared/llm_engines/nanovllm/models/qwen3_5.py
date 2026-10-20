@@ -70,17 +70,23 @@ def configure_qwen35_safe_legacy_kernels(enabled: bool) -> None:
     ShortConvolution = _DEFAULT_SHORT_CONVOLUTION
 
 from ..layers.activation import SiluAndMul
-from ..layers.attention import Attention
+from ..layers.attention import Attention, _efficient_causal_attention
+from shared.kernels.dispatch import choose
+try:
+    from shared.kernels import static_cache_attention as _static_cache_attention
+except (ImportError, OSError, RuntimeError):
+    _static_cache_attention = None
 from ..layers.layernorm import RMSNorm
 from ..layers.linear import ColumnParallelLinear, RowParallelLinear
 from ..utils.context import get_context
+from mmgp import cuda_graphs
 
 _CU_SEQLENS_CACHE: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
 _MROPE_FREQ_CACHE: dict[tuple[str, int, int, float], torch.Tensor] = {}
 
 
 def _safe_legacy_kernels_enabled(config) -> bool:
-    return bool(getattr(config, "_prompt_enhancer_safe_legacy", False))
+    return bool(getattr(config, "_prompt_enhancer_safe_legacy", False) or getattr(config, "_prompt_enhancer_safe_fused_kernels", False))
 
 
 def _get_tp_size() -> int:
@@ -467,10 +473,31 @@ class Qwen3_5StaticCache(Qwen3_5DynamicCache):
         self._seq_length = 0
         num_kv_heads = int(config.num_key_value_heads)
         head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
-        for layer_idx in self.transformer_layers:
-            self.key_cache[layer_idx] = torch.empty((1, self.max_cache_len, num_kv_heads, head_dim), device=device, dtype=dtype)
-            self.value_cache[layer_idx] = torch.empty((1, self.max_cache_len, num_kv_heads, head_dim), device=device, dtype=dtype)
+        for layer_idx in self.transformer_layers:  # zeros: the slots never written stay finite, so that a mask hides them (graph_attention)
+            self.key_cache[layer_idx] = torch.zeros((1, self.max_cache_len, num_kv_heads, head_dim), device=device, dtype=dtype)
+            self.value_cache[layer_idx] = torch.zeros((1, self.max_cache_len, num_kv_heads, head_dim), device=device, dtype=dtype)
         self.cache_seqlens = torch.zeros(1, dtype=torch.int32, device=device)
+        self.cache_positions = torch.arange(self.max_cache_len, device=device)
+        self.triton_kernels = not getattr(config, "_prompt_enhancer_safe_legacy", False)  # the legacy and cg engines use no Triton
+
+    def graph_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, layer_idx: int, scaling: float) -> torch.Tensor:
+        """Decoding attention with GPU cache positions and fixed shapes for CUDA graph replay, on GPUs without FlashAttention."""
+        positions = self.cache_seqlens + self.cache_positions[:query.shape[1]]
+        key_cache, value_cache = self.key_cache[layer_idx], self.value_cache[layer_idx]
+        key_cache.index_copy_(1, positions, key)
+        value_cache.index_copy_(1, positions, value)
+        if self.triton_kernels and _static_cache_attention is not None and choose("Static Cache Attention", owned_triton=_static_cache_attention.usable(query, key_cache)):
+            # reads each row's keys up to its own position only, in FP32: no copy of the cache, no score matrix
+            return _static_cache_attention.attention(query.contiguous(), key_cache, value_cache, self.cache_seqlens, scaling)
+        # the slots past the written ones are zeros (finite), which the mask hides
+        key, value = key_cache.transpose(1, 2), value_cache.transpose(1, 2)
+        repeats = query.shape[2] // key.shape[1]
+        mask = self.cache_positions[None, :] <= positions[:, None]
+        # Fold query heads into rows within each KV head instead of duplicating the full cache for GQA.
+        batch, count, heads, dim = query.shape
+        query = query.transpose(1, 2).reshape(batch, key.shape[1], repeats * count, dim)
+        output = F.scaled_dot_product_attention(query, key, value, attn_mask=mask.repeat(repeats, 1), dropout_p=0.0, scale=scaling)
+        return output.reshape(batch, heads, count, dim).transpose(1, 2)
 
     def prepare_append(self) -> None:
         self.cache_seqlens.fill_(self._seq_length)
@@ -544,6 +571,13 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         self.max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
         self.rope_theta = rope_theta
         self.rotary_dim = rotary_dim
+
+    def prepare_sequence_state(self, max_batch_size: int, device: torch.device, dtype: torch.dtype):
+        # the table the decoding graphs read, made before their capture and held as engine state while the runtime lives
+        self._freq_cache = _build_mrope_freq_cache(device, max_position=self.max_position_embeddings, rotary_dim=self.rotary_dim, rope_theta=self.rope_theta)
+
+    def release_sequence_state(self):
+        self._freq_cache = None
 
     def apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
         freqs_t = freqs[0]
@@ -619,6 +653,7 @@ def _flash_attention(
     key_lengths: list[int],
     scaling: float,
     flash_attention_fn,
+    efficient: bool = False,
 ) -> torch.Tensor:
     query_states, key_states, value_states = qkv_list
     qkv_list.clear()
@@ -656,6 +691,9 @@ def _flash_attention(
         q = query_states[idx, :q_len].transpose(0, 1)
         k = key_states[idx, : key_lengths[idx]].transpose(0, 1)
         v = value_states[idx, : key_lengths[idx]].transpose(0, 1)
+        if efficient:
+            outputs.append(_efficient_causal_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), scaling).squeeze(0).transpose(0, 1))
+            continue
         k = _repeat_kv(k.unsqueeze(0), q.shape[0] // k.shape[0]).squeeze(0)
         v = _repeat_kv(v.unsqueeze(0), q.shape[0] // v.shape[0]).squeeze(0)
         attention_mask = None
@@ -731,15 +769,20 @@ class Qwen3_5Block(nn.Module):
                 bias=bool(config.attention_bias),
             )
             self.attn = Attention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads)
-            if safe_legacy_kernels:
+            # Selected once by the loader for BF16 on pre-Ampere NVIDIA GPUs (no FlashAttention): memory-efficient FP32 prefill attention
+            self.attn.efficient_prefill = bool(getattr(config, "_prompt_enhancer_safe_fused_kernels", False))
+            # FlashAttention goes with the Triton kernels unless the loader decides it from what is installed
+            flash_attention = getattr(config, "_prompt_enhancer_flash_attention", not safe_legacy_kernels)
+            if not flash_attention:
                 self.attn.flash_attn_varlen_func = None
                 self.attn.flash_attn_with_kvcache = None
+            if safe_legacy_kernels:
                 self.attn.use_triton_kv_cache = False
             self.attn_q_norm = RMSNorm(self.head_dim, eps=float(config.rms_norm_eps))
             self.attn_k_norm = RMSNorm(self.head_dim, eps=float(config.rms_norm_eps))
             self.attn_q_norm.use_triton_rmsnorm = not safe_legacy_kernels
             self.attn_k_norm.use_triton_rmsnorm = not safe_legacy_kernels
-            self._flash_attn_varlen_func = None if safe_legacy_kernels else _DEFAULT_FLASH_ATTN_VARLEN_FUNC
+            self._flash_attn_varlen_func = _DEFAULT_FLASH_ATTN_VARLEN_FUNC if flash_attention else None
         else:
             self._short_convolution_cls = None if safe_legacy_kernels else _DEFAULT_SHORT_CONVOLUTION
             self._fast_recurrent_gated_delta_rule = None if safe_legacy_kernels else _DEFAULT_FAST_RECURRENT_GATED_DELTA_RULE
@@ -849,6 +892,9 @@ class Qwen3_5Block(nn.Module):
             state = self.recurrent_state_buffer
             if self.speculative_replay is None or not self.speculative_replay.fits(state, int(max_verify_tokens), state.dtype, state.dtype):
                 self.speculative_replay = RecurrentReplay(state, self.num_k_heads, self.head_k_dim, int(max_verify_tokens), state.dtype, state.dtype)
+                # the commit replays run in the engine's own graphs, which must not read weights that MMGP may stream: copies of the two
+                # small per-head parameters stay with the replay buffers
+                self._replay_ssm_parameters = tuple(t.detach().to(device=state.device, copy=True) for t in self._recurrence_ssm_parameters(getattr(self, "_gdn_direct_layout", True)))
             self.speculative_recurrent_state_buffer = torch.empty(0)
         else:
             self.speculative_replay = None
@@ -868,7 +914,7 @@ class Qwen3_5Block(nn.Module):
         # The recurrent state the last verification held after its first processed tokens, with the same kernel and arithmetic.
         from shared.kernels.qwen_gdn import recurrent_raw_replay
         direct_recurrent_layout = getattr(self, "_gdn_direct_layout", True)
-        ssm_a, ssm_dt = self._recurrence_ssm_parameters(direct_recurrent_layout)
+        ssm_a, ssm_dt = self._replay_ssm_parameters
         recurrent_raw_replay(self.speculative_replay, ssm_a, ssm_dt, int(processed_tokens), self.recurrent_state_buffer, **self._recurrence_layout(direct_recurrent_layout))
 
     def _recurrence_ssm_parameters(self, direct_recurrent_layout: bool):
@@ -934,6 +980,7 @@ class Qwen3_5Block(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         layer_idx: int,
         past_key_values: Qwen3_5DynamicCache | None,
+        cache_prepared: bool = False,
     ) -> torch.Tensor:
         hidden_states = _take_tensor(x_list)
         batch_size, seq_len, _ = hidden_states.shape
@@ -988,6 +1035,8 @@ class Qwen3_5Block(nn.Module):
                 softmax_scale=self.scaling,
                 causal=True,
             ).reshape(batch_size, seq_len, -1)
+        elif isinstance(past_key_values, Qwen3_5StaticCache) and cache_prepared:
+            attn_output = past_key_values.graph_attention(query_states, key_states, value_states, layer_idx, self.scaling).reshape(batch_size, seq_len, -1)
         elif past_key_values is not None:
             key_states, value_states = past_key_values.update(
                 key_states.transpose(1, 2),
@@ -1005,6 +1054,7 @@ class Qwen3_5Block(nn.Module):
                 key_lengths=[key_length] * batch_size,
                 scaling=self.scaling,
                 flash_attention_fn=self._flash_attn_varlen_func,
+                efficient=self.attn.efficient_prefill,
             ).reshape(batch_size, seq_len, -1)
         else:
             qkv_list = [
@@ -1344,6 +1394,7 @@ class Qwen3_5Block(nn.Module):
         layer_idx: int,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3_5DynamicCache | None = None,
+        cache_prepared: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = x_list
         x_list.clear()
@@ -1358,7 +1409,7 @@ class Qwen3_5Block(nn.Module):
         if self.layer_type == "full_attention":
             x_list = [hidden_states]
             hidden_states = None
-            hidden_states = self._forward_full_attention(x_list, position_embeddings, layer_idx, past_key_values)
+            hidden_states = self._forward_full_attention(x_list, position_embeddings, layer_idx, past_key_values, cache_prepared)
         else:
             x_list = [hidden_states]
             hidden_states = None
@@ -1451,24 +1502,41 @@ class Qwen3_5ForCausalLM(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, positions)
         residual = None
         draft_features = [] if self._block_draft else None
-        for layer_idx, block in enumerate(self.blk):
-            x_list = [hidden_states, residual]
-            hidden_states = residual = None
-            hidden_states, residual = block(
-                x_list,
-                position_embeddings,
-                layer_idx=layer_idx,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-            )
-            if draft_features is not None and layer_idx in self.mtp.target_layer_ids:
-                draft_features.append(hidden_states + residual)
+        if draft_features is None and attention_mask is None and past_key_values is None:
+            # MMGP: inside a graph scope, each run of blocks kept in VRAM is one graph, the streamed blocks go through their hooks
+            carry = [hidden_states, None]
+            hidden_states = None
+            hidden_states, residual = cuda_graphs.run_blocks(self, self.blk, self._run_block, carry, position_embeddings)
+        else:
+            for layer_idx, block in enumerate(self.blk):
+                x_list = [hidden_states, residual]
+                hidden_states = residual = None
+                hidden_states, residual = block(
+                    x_list,
+                    position_embeddings,
+                    layer_idx=layer_idx,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                )
+                if draft_features is not None and layer_idx in self.mtp.target_layer_ids:
+                    draft_features.append(hidden_states + residual)
         if draft_features is not None:
             self._draft_features = torch.cat(draft_features, dim=-1)
         norm_state_list = [hidden_states, residual]
         hidden_states = residual = None
         hidden_states, _ = self.output_norm.forward_list(norm_state_list)
         return hidden_states
+
+    @staticmethod
+    def _run_block(layer_idx: int, block: nn.Module, x_list: list, position_embeddings: tuple[torch.Tensor, torch.Tensor]) -> list:
+        return list(block(x_list, position_embeddings, layer_idx=layer_idx, attention_mask=None, past_key_values=None))
+
+    def nanovllm_graph_forward(self, input_ids: torch.Tensor, positions: torch.Tensor, outputs: torch.Tensor, draft_features: torch.Tensor | None = None) -> None:
+        """A decoding pass of the engine (cuda_graphs.run stage): the hidden states of input_ids written into outputs, the block drafters'
+        target features into draft_features. The context of the pass reads the engine's registered buffers."""
+        outputs.copy_(self(input_ids, positions).view(outputs.shape))
+        if draft_features is not None:
+            draft_features.copy_(self._draft_features.view(draft_features.shape))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
@@ -1577,7 +1645,7 @@ class Qwen3_5MTP(nn.Module):
             self._cache.prepare_append()
         x_list = [hidden_states, None]
         hidden_states = None
-        hidden_states, residual = self.block(x_list, position_embeddings, layer_idx=0, past_key_values=self._cache)
+        hidden_states, residual = self.block(x_list, position_embeddings, layer_idx=0, past_key_values=self._cache, cache_prepared=cache_prepared)
         if static_flash_cache and not cache_prepared:
             self._cache.advance(hidden_states.shape[1])
         norm_state_list = [hidden_states, residual]

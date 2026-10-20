@@ -529,6 +529,12 @@ def get_file_metadata(file_path):
     return OrderedDict(result[0]), dict(result[1])
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, GGUFWeightTensor) and cpu_linear.supported(tensor)
+
+
 def _filter_state_dict_basic(state_dict, base_model_prefix, keep_prefix=False):
     new_state_dict = {}
     start = -1
@@ -1531,6 +1537,9 @@ class GGUFWeightTensor(QTensor):
         else:
             target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=self.dtype)
             target_device = self.device
+        if self._data.device.type == "cpu" and getattr(self, "_mm_cpu_compute", False):  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(self, input, bias, target_dtype)
         if self._tensor_type == PrismQuantizationType.PTQ1_0 and target_device.type == "cuda":
             from .prism import ptq_linear
             return ptq_linear(input, self._data, list(self._tensor_shape), bias, target_dtype)
@@ -1811,7 +1820,7 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
         # Decode and short speculative batches (up to 8 rows): typed outputs and
         # fused SiLU-multiply avoid separate conversion and activation kernels
         # (bit-identical results). Prefill keeps the established kernels.
-        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor):
+        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor) and qweight._data.is_cuda:
             native = _gguf_cuda_module()
             supports = getattr(native, "supports_linear_fusions", None)
             if (callable(supports) and qweight.shape[1] % _quantization_sizes(qweight._tensor_type)[0] == 0

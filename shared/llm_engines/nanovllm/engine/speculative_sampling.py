@@ -32,7 +32,7 @@ def draft_probabilities(runner, seq, logits):
         top_k = None if seq.top_k is None else min(seq.top_k, logits.numel())
         target_probabilities(values, top_k, seq.top_p, seq.min_p, seq.temperature)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
             probabilities, _ = target_probabilities(values, top_k, seq.top_p, seq.min_p, seq.temperature)
         state = graph, values, probabilities
     graphs[key] = state
@@ -97,7 +97,7 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
                                 state["uniforms"], state["noise"], state["stops"], greedy=seq.top_k == 1)
         compute()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
             packed = compute()
         state.update(graph=graph, packed=packed)
     graphs[key] = state

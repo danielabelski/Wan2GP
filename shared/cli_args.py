@@ -30,7 +30,7 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--save-quantized", action="store_true", help="Save a quantized version of the current model")
     add("--convrot", action="store_true", help="Save INT8 ConvRot instead of Quanto INT8 (requires --save-quantized)")
     add("--test", action="store_true", help="Load the model and exit generation immediately")
-    add("--preload", type=str, default="0", help="Megabytes of each model to preload in VRAM (initial budget for dynamic profiles 1/3; overrides the Configuration preload of every kind of output)")
+    add("--preload", type=str, default="0", help="Megabytes of each model to preload in VRAM, at least (initial budget for dynamic profiles 1/3; overrides the Configuration preload of every kind of output)")
     add("--multiple-images", action="store_true", help="Allow inputting multiple images with image to video")
     add("--loras", type=str, default="", help="Root folder for LoRAs (default: loras)")
     add("--lora-config", type=load_lora_config, default={}, metavar="FILE", help="JSON mapping LoRA subfolder names to directory paths")
@@ -74,6 +74,7 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--attention", type=str, default="", help="attention mode")
     add("--vae-config", type=str, default="", help="vae config mode")
     add("--process", type=str, default="", help="Process a saved queue (.zip) or settings file (.json) without launching the web UI")
+    add("--offline", action="store_true", help="Never download anything: use only the files already on this computer; a missing file stops the operation with an error")
     add("--deepy-server", action="store_true", help="Serve the Deepy chat and media galleries without the Gradio UI")
     from shared.authentication import add_arguments
     add_arguments(parser)

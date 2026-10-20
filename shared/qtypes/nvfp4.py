@@ -710,6 +710,12 @@ def convert_nvfp4_to_quanto(state_dict, default_dtype=None, verboseLevel=1):
     return {"state_dict": state_dict, "quant_map": quant_map}
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, NVFP4WeightTensor) and cpu_linear.supported(tensor)
+
+
 def detect(state_dict, verboseLevel=1):
     matched = detect_nvfp4_state_dict(state_dict)
     details = describe_nvfp4_state_dict(state_dict) if matched else {}
@@ -1188,7 +1194,11 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         pre_quant_scale = getattr(self.qweight, "_pre_quant_scale", None)
         if pre_quant_scale is not None:
             input = input * pre_quant_scale.to(device=input.device, dtype=input.dtype)
-        return torch.nn.functional.linear(input, self.qweight, bias=self.bias)
+        qweight = self.qweight
+        if getattr(qweight, "_mm_cpu_compute", False) and qweight._data.device.type == "cpu":  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(qweight, input, self.bias, input.dtype)
+        return torch.nn.functional.linear(input, qweight, bias=self.bias)
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs

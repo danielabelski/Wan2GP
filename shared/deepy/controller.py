@@ -760,7 +760,7 @@ class DeepyController:
             active_session.prime_toolbox.close()
             active_session.prime_toolbox = None
         gen = self._deps.get_gen_info(state)
-        return DeepyZeroTools(
+        tools = DeepyZeroTools(
             gen,
             self._deps.get_processed_queue,
             send_cmd,
@@ -769,6 +769,8 @@ class DeepyController:
             record_file_metadata=self._deps.record_file_metadata,
             get_server_config=self._server_config,
         )
+        tools.zero_catalog = True
+        return tools
 
     def _build_session_system_prompt(self, session, tools) -> tuple[str, str]:
         host = getattr(self, 'workspace_host', None)

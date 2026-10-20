@@ -166,7 +166,7 @@ class family_handler:
             },
         }
 
-        if int(profile) in (2, 4, 5):
+        if int(profile) in (0, 2, 4, 5):
             pipe["budgets"] = {"transformer2": 200}
 
         return pipeline, pipe

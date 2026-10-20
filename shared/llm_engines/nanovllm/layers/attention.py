@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 
 try:
     import triton
@@ -326,6 +328,24 @@ def _build_causal_bias(query_len: int, key_len: int, device: torch.device, query
     bias.masked_fill_(~valid, float("-inf"))
     return bias
 
+def _efficient_causal_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float) -> torch.Tensor:
+    """Bottom-right causal attention of one sequence on GPUs without FlashAttention (Turing): PyTorch's memory-efficient kernel in FP32
+    in one call, which never materializes the scores and skips the masked tiles. The query heads sharing a KV head are folded into the
+    batch against a stride-0 view of that head: no copy of the keys and values per query head. query (1, heads, L, d), key and value
+    (1, kv_heads, S, d) in any float dtype; returns query's dtype."""
+    _, heads, length, dim = query.shape
+    kv_heads, keys = key.shape[1:3]
+    groups = heads // kv_heads
+    output = torch.empty_like(query, memory_format=torch.contiguous_format)
+    query = query.to(torch.float32, memory_format=torch.contiguous_format).view(kv_heads, groups, length, dim).transpose(0, 1)
+    key, value = key.float().expand(groups, -1, -1, -1), value.float().expand(groups, -1, -1, -1)
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        result = F.scaled_dot_product_attention(query, key, value, attn_mask=causal_lower_right(length, keys), scale=scale)
+    del query, key, value
+    output.view(kv_heads, groups, length, dim).transpose(0, 1).copy_(result)
+    return output
+
+
 def _gather_cache_tokens(cache: torch.Tensor, block_table: torch.Tensor, seq_len: int) -> torch.Tensor:
     if seq_len <= 0:
         return cache.new_empty((0, cache.shape[-2], cache.shape[-1]))
@@ -345,6 +365,10 @@ def _flash_attention_fallback_prefill(
     context,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    *,
+    efficient: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     outputs = []
     use_prefix_cache = context.block_tables is not None
@@ -358,6 +382,19 @@ def _flash_attention_fallback_prefill(
         if q_len <= 0:
             continue
         q_i = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        if efficient:
+            if use_prefix_cache:  # the occupied pages only, dequantized straight to the FP32 the attention computes in
+                table = context.block_tables[idx]
+                keys = _gather_cache_tokens(k_cache, table, k_len)
+                values = _gather_cache_tokens(v_cache, table, k_len)
+                if k_scale is not None:
+                    keys = _dequantize_kvcache(keys, _gather_cache_tokens(k_scale, table, k_len), torch.float32)
+                    values = _dequantize_kvcache(values, _gather_cache_tokens(v_scale, table, k_len), torch.float32)
+            else:
+                keys, values = k[k_start:k_end], v[k_start:k_end]
+            output = _efficient_causal_attention(q_i, keys.transpose(0, 1).unsqueeze(0), values.transpose(0, 1).unsqueeze(0), scale)
+            outputs.append(output.squeeze(0).transpose(0, 1))
+            continue
         if use_prefix_cache:
             k_i = _gather_cache_tokens(k_cache, context.block_tables[idx], k_len).transpose(0, 1).unsqueeze(0)
             v_i = _gather_cache_tokens(v_cache, context.block_tables[idx], k_len).transpose(0, 1).unsqueeze(0)
@@ -572,9 +609,25 @@ class Attention(nn.Module):
         self.flash_attn_varlen_func = _DEFAULT_FLASH_ATTN_VARLEN_FUNC
         self.flash_attn_with_kvcache = _DEFAULT_FLASH_ATTN_WITH_KVCACHE
         self.use_triton_kv_cache = _DEFAULT_USE_TRITON_KV_CACHE
+        self.efficient_prefill = False  # set by the model on GPUs without FlashAttention: one memory-efficient FP32 SDPA per sequence
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = torch.tensor([])
         self._q8_speculative_metadata = {}
+
+    def prepare_speculative_metadata(self, max_query_count: int, max_num_blocks: int) -> None:
+        if self.k_cache.dtype != torch.int8 or not self.k_cache.is_cuda or _Q8_PAGED_ATTENTION is None:
+            return
+        if self.use_triton_kv_cache and triton is not None and self.head_dim in (32, 64, 128, 256):
+            return
+        # Allocate before graph-state registration; eager and captured calls share fixed-width tables.
+        self._q8_speculative_metadata = {
+            count: (
+                torch.arange(1, count + 1, dtype=torch.int32, device=self.k_cache.device),
+                torch.empty(count, dtype=torch.int32, device=self.k_cache.device),
+                torch.empty(count, max_num_blocks, dtype=torch.int32, device=self.k_cache.device),
+            )
+            for count in range(1, max_query_count + 1)  # a verification without drafted tokens left has one query
+        }
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, cache_written=False):
         context = get_context()
@@ -598,18 +651,10 @@ class Attention(nn.Module):
             if context.speculative_verify:
                 _log_kv_attention_backend_once("speculative_llamacpp_q8", f"[Deepy][Speculative] verification backend=batched llama.cpp fattn-vec Q8 paged attention ({dtype_name} I/O, FP32 accumulation, no dense KV materialization).")
                 query_count = q.shape[0]
-                metadata = self._q8_speculative_metadata.get(query_count)
-                # Eager block tables widen as the context grows; graph tables stay fixed.
-                if metadata is None or metadata[2].shape[1] != context.block_tables.shape[1]:
-                    metadata = (
-                        torch.arange(1, query_count + 1, dtype=torch.int32, device=q.device),
-                        torch.empty(query_count, dtype=torch.int32, device=q.device),
-                        torch.empty(query_count, context.block_tables.shape[1], dtype=torch.int32, device=q.device),
-                    )
-                    self._q8_speculative_metadata[query_count] = metadata
-                query_offsets, context_lens, block_tables = metadata
+                query_offsets, context_lens, block_tables = self._q8_speculative_metadata[query_count]
                 context_lens.copy_(query_offsets).add_(context.cu_seqlens_k[1] - query_count)
-                block_tables.copy_(context.block_tables.expand(query_count, -1))
+                block_tables.fill_(-1)
+                block_tables[:, :context.block_tables.shape[1]].copy_(context.block_tables.expand(query_count, -1))
                 return _q8_paged_speculative(q, k_cache, v_cache, self.k_scale, self.v_scale, context_lens, block_tables, self.scale)
             elif context.is_prefill:
                 _log_kv_attention_backend_once("prefill_triton_q8", f"[Deepy][KV cache] prefix prefill backend=tiled Q8 paged attention ({dtype_name} I/O, FP32 accumulation, no dense KV materialization).")
@@ -619,6 +664,15 @@ class Attention(nn.Module):
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = q8_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output.squeeze(1) if context.speculative_verify else output
+        if (self.efficient_prefill and context.is_prefill and not context.speculative_verify
+                and self.flash_attn_varlen_func is None):
+            # Gather occupied pages before dequantizing on the hardware-selected
+            # SDPA route, rather than expanding the entire reserved Q8 cache.
+            return _flash_attention_fallback_prefill(
+                q, k, v, self.scale, self.num_heads // self.num_kv_heads, context, k_cache, v_cache,
+                efficient=True,
+                k_scale=self.k_scale if quantized_cache else None, v_scale=self.v_scale if quantized_cache else None,
+            )
         attention_k_cache = _dequantize_kvcache(k_cache, self.k_scale, q.dtype) if quantized_cache and reads_cache else k_cache
         attention_v_cache = _dequantize_kvcache(v_cache, self.v_scale, q.dtype) if quantized_cache and reads_cache else v_cache
         # AMD Triton FA2 exposes the FlashAttention functions, but rejects their

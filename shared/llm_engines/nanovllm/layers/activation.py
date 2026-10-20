@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from shared.kernels.dispatch import triton_dtype_supported
 
 try:
     import triton
@@ -39,7 +40,7 @@ class SiluAndMul(nn.Module):
 
 
 def silu_mul(x, use_triton=True):
-    if use_triton and x.is_cuda and triton is not None:
+    if use_triton and x.is_cuda and triton is not None and triton_dtype_supported(x.device, x.dtype):
         x = x.contiguous()
         output = torch.empty((*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype)
         _silu_mul_kernel[(triton.cdiv(output.numel(), 256),)](x, output, output.shape[-1], output.numel(), 256)

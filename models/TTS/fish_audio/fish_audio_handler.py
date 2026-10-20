@@ -77,9 +77,9 @@ class family_handler:
             save_quantized_model(pipeline.transformer2, model_type, codebooks, torch.bfloat16, config, submodel_no=2, convrot_prefixes=("",))
         offload_def = {"pipe": {"transformer": pipeline.transformer, "transformer2": pipeline.transformer2, "vae": pipeline.vae}, "cudaGraphs": lm_decoder_engine != "legacy",
             "coTenantsMap": {"transformer": ["transformer2"], "transformer2": ["transformer"]}}
-        if int(profile) in (2, 4, 5):
-            # Both stages run at every audio frame: streaming them would cost a full transfer of their weights per frame. Without a
-            # VRAM preload they stay whole in VRAM (their routed experts stay on the CPU).
+        if int(profile) in (0, 2, 4, 5):
+            # Both stages run at every audio frame: streaming them would cost a full transfer of their weights per frame. They stay
+            # whole in VRAM, also with a VRAM preload (their routed experts stay on the CPU).
             offload_def["budgets"] = {"transformer": 0, "transformer2": 0}
         return pipeline, offload_def
 

@@ -152,7 +152,7 @@ class BlockDraftRunner(ModelRunner):
             noise = torch.ones((draft_count, unary.shape[-1]), dtype=torch.float32, device=hidden.device)
             self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold)
             state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length)
             graphs[key] = state
@@ -269,7 +269,7 @@ class BlockDraftRunner(ModelRunner):
             noise = torch.ones((draft_count, self.model.mtp.candidate_selector.top_k), dtype=torch.float32, device=hidden.device)
             self._dflash_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dflash_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise)
             state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length)
             graphs[key] = state

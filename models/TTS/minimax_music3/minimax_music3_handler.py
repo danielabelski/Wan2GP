@@ -196,7 +196,7 @@ class family_handler:
                 "condition_encoder": ["transformer"],
             },
         }
-        if int(profile) in (2, 4, 5):
+        if int(profile) in (0, 2, 4, 5):
             offload_def["budgets"] = {"transformer": 400, "text_encoder": 800}
         return pipeline, offload_def
 

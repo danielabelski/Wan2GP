@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 from typing import Optional
 import os
+from shared.kernels.dispatch import triton_dtype_supported
 
 try:
     import triton
@@ -55,7 +56,7 @@ def apply_sparse_repetition_penalty_(logits: torch.Tensor, stored_ids: torch.Ten
     total = int(stored_count) + new_count + virtual_count
     if total == 0 or float(penalty) == 1.0:
         return
-    if use_triton and logits.is_cuda and triton is not None:
+    if use_triton and logits.is_cuda and triton is not None and triton_dtype_supported(logits.device, logits.dtype):
         new_values = [*new_token_ids, *([-1] * (_REPETITION_INCREMENT_LIMIT - new_count))]
         first_virtual_count = min(virtual_count, _REPETITION_INCREMENT_LIMIT)
         virtual_values = [*virtual_token_ids[:first_virtual_count], *([-1] * (_REPETITION_INCREMENT_LIMIT - first_virtual_count))]
@@ -83,7 +84,7 @@ def apply_min_p_mask_(logits: torch.Tensor, min_p: float, use_triton: bool = Fal
 
     max_logit = logits.max()
     log_min_p = math.log(float(min_p))
-    if use_triton and logits.is_cuda and logits.is_contiguous() and triton is not None:
+    if use_triton and logits.is_cuda and logits.is_contiguous() and triton is not None and triton_dtype_supported(logits.device, logits.dtype):
         n_elements = logits.numel()
         _min_p_mask_kernel[(triton.cdiv(n_elements, 256),)](logits, max_logit, n_elements, log_min_p, BLOCK_SIZE=256, num_warps=8, num_stages=3)
     else:

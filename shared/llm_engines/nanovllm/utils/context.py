@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import torch
+from mmgp import cuda_graphs
 
 
 @dataclass
@@ -27,3 +28,12 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
+
+
+def _graph_key():
+    # the Python values of the context that change what the blocks compute: part of the keys of their MMGP graphs
+    context = _CONTEXT
+    return context.is_prefill, context.has_previous_state, context.speculative_verify, context.block_tables is None, context.max_seqlen_q, context.max_seqlen_k
+
+
+cuda_graphs.register_key(_graph_key)

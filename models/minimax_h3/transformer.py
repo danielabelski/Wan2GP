@@ -109,21 +109,12 @@ def unpack_audio(rows, ch=2):
     return unpack_audio_tokens(rows, rows.shape[0] // ch).permute(1, 0, 2).unsqueeze(0)
 
 
-def _split_interleaved_qkv(src, dim, split_sizes, context):
-    info = context["info"]
-    heads, head_dim = info["num_attention_heads"], info["attention_head_dim"]
-    grouped = src.reshape(heads, 3, head_dim, *src.shape[1:])
-    return [grouped[:, index].reshape(split_sizes[index], *src.shape[1:]).contiguous() for index in range(3)]
-
-
 def get_linear_split_map(inner_size, num_attention_heads=56, attention_head_dim=128, qkv_layout="interleaved"):
+    # interleaved rows (heads, q/k/v, head_dim): MMGP keeps the fused weight and computes q, k and v from it in place (row views)
     if qkv_layout not in ("interleaved", "grouped"):
         raise ValueError(f"Unsupported MiniMax H3 QKV layout {qkv_layout!r}")
-    split = {"mapped_modules": ["q_proj", "k_proj", "v_proj"], "split_sizes": [inner_size] * 3,
-             "num_attention_heads": num_attention_heads, "attention_head_dim": attention_head_dim}
-    if qkv_layout == "interleaved":
-        split["split_handlers"] = {"weight": _split_interleaved_qkv}
-    return {"qkv_proj": split}
+    return {"qkv_proj": {"mapped_modules": ["q_proj", "k_proj", "v_proj"], "split_sizes": [inner_size] * 3, "num_attention_heads": num_attention_heads,
+                         "attention_head_dim": attention_head_dim, "interleaved": qkv_layout == "interleaved"}}
 
 
 def _take(x_list):
@@ -221,6 +212,7 @@ class Attention(nn.Module):
         self.sol_attention = sol_attention
         inner = heads * head_dim
         self.qkv_proj = nn.Linear(hidden, 3 * inner, bias=False, dtype=dtype, device=device)
+        self.qkv_interleaved = False  # rows of an unsplit qkv_proj (heads, q/k/v, head_dim) rather than (q/k/v, heads, head_dim)
         self.q_norm = nn.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.k_norm = nn.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = nn.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
@@ -277,10 +269,13 @@ class Attention(nn.Module):
         else:
             qkv = self.qkv_proj(x)
             x = None
-            query, key, value = qkv.split(self.heads * self.head_dim, dim=-1)
-            query = query.view(seq_len, self.heads, self.head_dim)
-            key = key.view(seq_len, self.heads, self.head_dim)
-            value = value.view(seq_len, self.heads, self.head_dim)
+            if self.qkv_interleaved:
+                query, key, value = qkv.view(seq_len, self.heads, 3, self.head_dim).unbind(2)
+            else:
+                query, key, value = qkv.split(self.heads * self.head_dim, dim=-1)
+                query = query.view(seq_len, self.heads, self.head_dim)
+                key = key.view(seq_len, self.heads, self.head_dim)
+                value = value.view(seq_len, self.heads, self.head_dim)
             query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
             if not use_sol:
                 value = value.clone()

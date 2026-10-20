@@ -191,7 +191,7 @@ class BlockDraft(nn.Module):
                 fixed_positions.copy_(positions)
                 self._append_context_tensors(inputs, fixed_positions, indices)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self._append_graph_pool):
+                with torch.cuda.graph(graph, pool=self._append_graph_pool, capture_error_mode="thread_local"):
                     self._append_context_tensors(inputs, fixed_positions, indices)
                 self._append_graph_pool = graph.pool()
                 state = (graph, inputs, fixed_positions, indices)
@@ -252,7 +252,7 @@ class BlockDraft(nn.Module):
             positions = torch.arange(start_position, start_position + self.block_size, device=ids.device).unsqueeze(0)
             self._forward_block(ids, positions, embedding, output)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 hidden, logits = self._forward_block(ids, positions, embedding, output)
             self._proposal_buffers = (ids, positions, hidden, logits)
             self._proposal_graph = graph

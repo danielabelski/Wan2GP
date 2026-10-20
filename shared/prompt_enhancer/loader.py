@@ -149,7 +149,7 @@ def _load_joycaption_prompt_enhancer():
     return llm_model, llm_tokenizer, 10000
 
 
-def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_decoder_engine: str = "", qwen_backend: str = "quanto_int8", speculative_decoding: bool = False, deepy_kv_cache_quantization: str = "") -> PromptEnhancerRuntime:
+def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_backend: str = "quanto_int8", speculative_decoding: bool = False, deepy_kv_cache_quantization: str = "") -> PromptEnhancerRuntime:
     enhancer_enabled = int(enhancer_enabled)
     runtime = PromptEnhancerRuntime()
     if enhancer_enabled <= 0:
@@ -200,7 +200,6 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_de
             default_dtype=default_dtype,
             backend=backend,
             attn_implementation="sdpa",
-            requested_lm_engine=lm_decoder_engine,
             variant=qwen35_variant,
             speculative_decoding=speculative_decoding,
             kv_cache_int8=deepy_kv_cache_quantization == "int8",

@@ -71,11 +71,17 @@ def speculative_decoding_runtime(value):
     return {"auto": 2, "disabled": 0, "mtp": 1}.get(method, method), tokens
 
 
-def speculative_decoding_ui_state(enhancer_enabled, quantization, engine, value, tokens=None):
+def block_drafters_supported() -> bool:
+    """DSpark and DFlash2 run on Triton and FlashAttention 2 (the LLM engine uses them whenever they are installed)."""
+    from shared.llm_engines.nanovllm.vllm_support import probe_vllm_runtime
+    return bool(probe_vllm_runtime()["supported"])
+
+
+def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=None):
     methods = ["auto", "disabled"]
     if prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
         methods.append("mtp")
-    if int(enhancer_enabled or 0) == 5 and quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") and engine in ("", "vllm"):
+    if int(enhancer_enabled or 0) == 5 and quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") and block_drafters_supported():
         methods.extend(BLOCK_DRAFT_METHODS)
     if isinstance(value, str) and value in SPECULATIVE_METHOD_LABELS:
         method, count = value, tokens

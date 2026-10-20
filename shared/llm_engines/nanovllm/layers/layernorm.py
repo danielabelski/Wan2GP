@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from shared.kernels.dispatch import triton_dtype_supported
 
 try:
     import triton
@@ -85,6 +86,8 @@ class RMSNorm(nn.Module):
         if x.stride(-1) != 1 or self.weight.stride(-1) != 1:
             return False
         if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        if not triton_dtype_supported(x.device, x.dtype) or not triton_dtype_supported(self.weight.device, self.weight.dtype):
             return False
         if residual is not None:
             if residual.device != x.device or residual.dtype != x.dtype or residual.stride(-1) != 1:

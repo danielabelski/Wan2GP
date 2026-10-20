@@ -811,7 +811,7 @@ def _benchmark_config_ms(kind: str, cfg: tuple[int, int, int, int, int], tensors
             end = torch.cuda.Event(enable_timing=True)
             if _use_cg_autotune(_device_index(device)):
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                     for _ in range(iters):
                         _launch_candidate(kind, cfg, tensors, m, n, k)
                 graph.replay()

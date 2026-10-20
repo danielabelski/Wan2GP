@@ -100,6 +100,8 @@ class _Plan:
         self.slow = set()  # blocks not pinned: staged through RAM at each transfer, the first to keep in VRAM
         self.recoveries = None  # the allocator's recoveries when a cycle with blocks kept in VRAM started (None: no block kept)
         self.measuring = False  # the cycle running measures a new workload with the budget's preload: the next one may keep other blocks
+        self.workload_of = workload  # or the model's _auto_preload_workload(args, kwargs): its own grouping of the inputs into workloads
+        self.cap = None  # or the model's _auto_preload_max: the most VRAM its weights may hold (base, blocks kept, slots of the streamed ones)
 
 
 class AutoPreload:
@@ -128,10 +130,11 @@ class AutoPreload:
         memory_pressure.unregister(self)
 
     def after_pinning(self):
-        """The RAM is pinned: the blocks that are not pinned are the first to keep in VRAM. Nothing is in VRAM yet."""
+        """The RAM is pinned: the blocks that are not pinned are the first to keep in VRAM (those of the models of the pinned pool are pinned
+        as they stream). Nothing is in VRAM yet."""
         m = self.manager
         for plan in self.plans.values():
-            plan.slow = {name for name in plan.sizes if m._block_items(plan.model_id + "/" + name)[2] is None}
+            plan.slow = set() if plan.model_id in m.pool_models else {name for name in plan.sizes if m._block_items(plan.model_id + "/" + name)[2] is None}
             plan.ranking = ranked_blocks([floors for _, floors in plan.towers], plan.slow)
             self._set(plan, plan.ranking[:plan.floor])
 
@@ -145,7 +148,10 @@ class AutoPreload:
                 towers.append((tower_name, [(name, size) for _, name, size in floors]))
         if not towers:
             return None
-        return _Plan(model_id, type(m.models[model_id]).__name__, towers, m.blocks_of_modules_sizes.get(model_id, 0))
+        plan = _Plan(model_id, type(m.models[model_id]).__name__, towers, m.blocks_of_modules_sizes.get(model_id, 0))
+        plan.workload_of = getattr(m.models[model_id], "_auto_preload_workload", None) or workload
+        plan.cap = getattr(m.models[model_id], "_auto_preload_max", None)
+        return plan
 
     def _weights(self, plan, preloaded):
         """VRAM of the model's weights with these blocks preloaded: its base, the blocks and the slots of the blocks streamed."""
@@ -157,6 +163,8 @@ class AutoPreload:
         """The longest prefix of the ranking that fits beside a peak of activations, with the base and the slots of the streamed blocks."""
         stats = allocator.stats()
         target = stats["reserved"] + allocator.room() - peak - MARGIN - int(MARGIN_SHARE * peak)
+        if plan.cap is not None:
+            target = min(target, plan.cap)
         if plan.base + sum(plan.sizes.values()) <= target:
             return list(plan.ranking)
         shuttle, used, count = (self.window + 1) * plan.largest, plan.base, 0
@@ -209,7 +217,7 @@ class AutoPreload:
         loaded = self.manager.loaded_blocks[model_id]
         if loaded is not None and self.keep(model_id, loaded):  # the last block streamed to grow a plan: no streamed block retires it any more
             self.manager.loaded_blocks[model_id] = None
-        work = workload(args, kwargs)
+        work = plan.workload_of(args, kwargs)
         peak = self.measures.get((*plan.structure, work))
         wanted = plan.ranking[:plan.floor] if peak is None else self._fit(plan, peak)
         current = self.manager.preloaded_blocks_per_model[model_id]
@@ -260,7 +268,10 @@ class AutoPreload:
         cycle), and the measured peak of the workload grows by what was released: its next plans leave that memory free instead of growing
         back into the same shortage at every step."""
         m, freed = self.manager, 0
-        if self.dropping or need <= 0 or threading.get_ident() != self.thread or cuda_graphs.recording():
+        if self.thread is None and any(model_id in self.plans for model_id in m.active_models_ids):
+            self.thread = threading.get_ident()  # no cycle ran yet: the thread loading the models is the one that runs their blocks
+        # nor while any CUDA graph is captured on this thread's stream (a model's own graphs): unloading blocks would invalidate the capture
+        if self.dropping or need <= 0 or threading.get_ident() != self.thread or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
             return 0
         need += MARGIN
         for model_id in reversed(m.active_models_ids):
