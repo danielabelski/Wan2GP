@@ -132,9 +132,6 @@ class HeartMuLa(PreTrainedModel):
         self.decoder, decoder_dim = _prepare_transformer(
             FLAVORS[config.decoder_flavor]()
         )
-        for layer in self.backbone.layers:
-            if hasattr(layer, "attn"):
-                layer.attn.allow_flash2_kvcache = True
         self.text_embeddings = nn.Embedding(config.text_vocab_size, backbone_dim)
         self.audio_embeddings = nn.Embedding(
             config.audio_vocab_size * config.audio_num_codebooks, backbone_dim
@@ -155,6 +152,12 @@ class HeartMuLa(PreTrainedModel):
 
     def set_cuda_graphs(self, enabled: bool) -> None:
         self._cuda_graph_hooks.set_cuda_graphs(enabled)
+
+    def set_flash_attention(self, enabled: bool) -> None:
+        # FlashAttention 2 for the backbone's KV cache attention, where WanGP's LM features allow it (compute capability 8.0+)
+        for layer in self.backbone.layers:
+            if hasattr(layer, "attn"):
+                layer.attn.allow_flash2_kvcache = enabled
 
     def prepare_decode_cuda_graph(
         self, *, max_backbone_tokens: int, max_decoder_tokens: int

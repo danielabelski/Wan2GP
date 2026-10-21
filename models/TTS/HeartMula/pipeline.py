@@ -104,6 +104,7 @@ class HeartMuLaPipeline:
         codec_version: str = "",
         VAE_dtype = torch.float32,
         cuda_graphs=False,
+        flash_attention=False,
     ):
         self.device = device or torch.device("cpu")
         self.mula_device = self.device
@@ -120,6 +121,7 @@ class HeartMuLaPipeline:
         self.heartmula_weights_path = heartmula_weights_path
         self.VAE_dtype = VAE_dtype
         self.cuda_graphs = bool(cuda_graphs)
+        self.flash_attention = bool(flash_attention)
 
         self.ckpt_root = Path(ckpt_root) if ckpt_root is not None else Path(
             fl.get_download_location()
@@ -169,6 +171,7 @@ class HeartMuLaPipeline:
 
         self.mula._interrupt_check = self._abort_requested
         self.mula.set_cuda_graphs(self.cuda_graphs)
+        self.mula.set_flash_attention(self.flash_attention)
         self.model = self.mula
         self.mula.eval()
         first_param = next(self.mula.parameters(), None)

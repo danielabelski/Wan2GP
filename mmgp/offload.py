@@ -1,5 +1,5 @@
 # Copyright (c) 2024-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-# ------------------ Memory Management 4.2.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 4.2.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -388,9 +388,9 @@ class _PinningCopier:
         futures = self.blocks[next(reversed(self.blocks))]
         holder, left = [source], [(length + STAGING_CHUNK_SIZE - 1) // STAGING_CHUNK_SIZE]
         # a source mapped from a checkpoint: its pages leave the working set once copied, rather than when its whole view of the file is
-        # released (the end of the pinning, or never if a part of the view is not pinned)
-        start, end = (source.data_ptr() + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE, (source.data_ptr() + length) // PAGE_SIZE * PAGE_SIZE
-        mapped = [(start, end)] if os.name == "nt" and end > start and not _private_memory([source.data_ptr()])[0] else None
+        # released (the end of the pinning, or never if a part of the view is not pinned). A page it shares with a source copied later comes
+        # back and leaves again with that one
+        mapped = _mapped_pages([(source.data_ptr(), length)])
         def copied(_):
             with self.lock_guard:
                 left[0] -= 1
@@ -1179,6 +1179,8 @@ class _StagingRing:
 
 PAGE_SIZE = 4096
 POOL_RAM_FLOOR = max(4 << 30, physical_memory // 10) # the pinned pool grows while the system keeps this much RAM available (as the VRAM allocator before it spills)
+DROP_ONCE_PER_GENERATION_PAGES = True # after each transfer of a block of a model that runs once or twice per generation, the checkpoint pages it read leave the working set (when the RAM is short)
+ONCE_PER_GENERATION_MODELS = ("text_encoder", "text_encoder_2", "vae") # unless the model sets _mm_pinned_pool (e.g. a language model registered as a text encoder)
 
 if os.name == "nt":
     class _MemoryInformation(ctypes.Structure):
@@ -1194,10 +1196,32 @@ def _drop_mapped_pages(ranges):
     # the pages of a checkpoint mapping that a copy has read stay in the process' working set beside the copy, counted as used RAM, until
     # Windows trims them under pressure (a read-only mapping included): dropped at once (VirtualUnlock on pages that are not locked), they
     # wait on the standby list, available, and come back without reading the drive if the mapping is read again soon. On Linux the available
-    # memory already counts the pages of mapped files.
+    # memory already counts the pages of mapped files. About 75 ms per GiB of pages read, whatever the call (unmapping the view costs as
+    # much): the system takes each page out of the working set. On a thread of its own it was slower, the copy threads reading the next
+    # blocks waiting for it
     if os.name == "nt":
         for start, end in ranges:
             _virtual_unlock(start, end - start)
+
+def _mapped_pages(leaves):
+    # the pages of the tensors (address, bytes) mapped from a checkpoint file, to drop once copied: rounded out to whole pages, a range per
+    # run of tensors that follow each other in a view of the file (one call each). A page shared with a tensor not read yet, dropped, comes
+    # back from the standby list without reading the drive when that tensor is read (and is dropped again with it). Windows only
+    if os.name != "nt":
+        return []
+    info, ranges, region = _MemoryInformation(), [], (0, 0, None)
+    for pointer, nbytes in sorted(leaves):
+        if not region[0] <= pointer < region[1]:
+            found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
+            region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type != 0x20000 else None) if found else (0, 0, None) # not MEM_PRIVATE: its view
+        if region[2] is None or nbytes == 0:
+            continue
+        start, end = pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+        if ranges and ranges[-1][2] == region[2] and start <= ranges[-1][1]: # one call never spans two views
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end, region[2]])
+    return [(start, end) for start, end, _ in ranges]
 
 def _private_memory(pointers):
     # whether each address (in increasing order) lies in RAM the process allocated (PyTorch's allocators, the heap), rather than in a mapping
@@ -1241,8 +1265,8 @@ class _PoolEntry:
 # How a block enters the pinned pool, made once for its layout: the page ranges to lock in place [(start, end, storages)] and their sources
 # [(offset in the block's VRAM buffer, uint8 tensor)], the runs copied into a buffer of locked RAM of its own (_copy_runs), the size of that
 # buffer, its pieces [(offset in the VRAM buffer, offset in the buffer, bytes)], the bytes locked and the plain tensors as (address, bytes)
-_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped") # mapped: the whole pages of the
-# tensors mapped from a checkpoint file [(start, end)], dropped from the working set once copied
+_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped") # mapped: the pages of the
+# tensors mapped from a checkpoint file [(start, end)] (_mapped_pages), dropped from the working set once copied
 
 
 class _PinnedPool:
@@ -1309,8 +1333,8 @@ class _PinnedPool:
             start, end = (key[0] + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE, (key[0] + key[1]) // PAGE_SIZE * PAGE_SIZE
             if not private or end <= start:
                 copied.append((key[0], key[0], key[1]))
-                if not private and end > start:
-                    mapped.append((start, end))
+                if not private:
+                    mapped.append(key)
                 continue
             storage = leaves[key].untyped_storage()
             if ranges and start == ranges[-1][1]:
@@ -1336,7 +1360,7 @@ class _PinnedPool:
         pieces = merged([[layout[1][pointer] + part - pointer, offsets[part], nbytes, None] for pointer, part, nbytes in copied], lambda a, b: True)
         copy_nbytes = (copy_nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE if copied else 0
         return _PoolPlan(layout, [(start, end, storages) for start, end, storages in ranges], sources, runs, copy_nbytes, [tuple(piece[:3]) for piece in pieces],
-                         builtins.sum(end - start for start, end, _ in ranges) + copy_nbytes, tuple(keys), mapped)
+                         builtins.sum(end - start for start, end, _ in ranges) + copy_nbytes, tuple(keys), _mapped_pages(mapped))
 
     def prepare(self, manager, model_id, entry_name, plan):
         """The future of a block's entry, made on the pool's thread from its plan: True once it is in, False if it could not enter."""
@@ -1869,7 +1893,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 4.2.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 4.2.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -3777,6 +3801,8 @@ class offload:
         self.pool_others = {} # model id -> (count of its blocks kept in VRAM, its blocks out of VRAM outside its towers)
         self.pool_wanted = {} # model id -> (key, the blocks the pool may take for it)
         self.pool_plans = {} # entry name -> how its block enters the pool (_PoolPlan), made at profile time for the blocks of pool models
+        self.mapped_pages = {} # entry name -> (layout, the pages of its tensors mapped from a checkpoint file), of the models that run once or twice per generation
+        self.mapped_bytes = {} # model id -> bytes of these pages, of all its blocks
 
         global last_offload_obj
         last_offload_obj = self
@@ -4159,6 +4185,26 @@ class offload:
             plan = self.pool_plans[entry_name] = _PinnedPool.plan(items, layout)
         return plan
 
+    def _drops_pages(self, model_id):
+        # whether the checkpoint pages read for a model's transfers leave the working set at once, available to the other models rather than
+        # counted as used until Windows trims them: a model that runs once or twice per generation (a text encoder, a VAE; kept out of the
+        # pinned pool; pinned memory has none), when keeping all its pages could bring the available RAM under POOL_RAM_FLOOR. Dropping costs
+        # about 75 ms per GiB, as much as Windows' own trimming under pressure: with RAM to spare the pages stay, for nothing
+        if not (DROP_ONCE_PER_GENERATION_PAGES and not getattr(self.models[model_id], "_mm_pinned_pool", model_id not in ONCE_PER_GENERATION_MODELS)):
+            return False
+        mapped = self.mapped_bytes.get(model_id)
+        if mapped is None:
+            mapped = self.mapped_bytes[model_id] = builtins.sum(end - start for entry in self.blocks_of_modules if entry.split("/", 1)[0] == model_id for start, end in self._mapped_pages(entry))
+        return mapped > 0 and psutil.virtual_memory().available < POOL_RAM_FLOOR + mapped
+
+    def _mapped_pages(self, entry_name):
+        # the pages of a block's tensors mapped from a checkpoint file, for its current layout
+        items, layout, _ = self._block_items(entry_name)
+        found = self.mapped_pages.get(entry_name)
+        if found is None or found[0] is not layout:
+            found = self.mapped_pages[entry_name] = (layout, _mapped_pages([(leaf.data_ptr(), leaf.numel() * leaf.element_size()) for _, t in items for leaf in _staging_leaves(t)]))
+        return found[1]
+
     def _pool_leaves(self, entry_name):
         # the plain tensors of a block as they are now, as (address, bytes)
         return {(leaf.data_ptr(), leaf.numel() * leaf.element_size()) for _, _, p, _, tied in self.blocks_of_modules[entry_name] if tied is None
@@ -4523,10 +4569,8 @@ class offload:
             torch.cuda.synchronize()
         if not preload:
             self.loaded_blocks[model_id] = blocks_name
-        if model_id in self.pool_models and not self._pool_admits(model_id):
-            # a model kept out of the pinned pool runs once or twice per generation (a text encoder): the checkpoint pages its transfer read
-            # leave the working set at once, available to the other models rather than counted as used until Windows trims them
-            _drop_mapped_pages(self._pool_plan(entry_name).mapped)
+        if self._drops_pages(model_id):
+            _drop_mapped_pages(self._mapped_pages(entry_name))
 
         # cl.stop()
         # print(f"load time: {cl.format_time_gap()}")
@@ -4624,6 +4668,11 @@ class offload:
                 self.loaded_blocks[model_id] = None
             for entry in [entry for entry in self.inflight if entry.startswith(model_id + "/")]:
                 self.gpu_unload_blocks(model_id, entry[len(model_id) + 1:])
+            if self._drops_pages(model_id):
+                # also the blocks that the staging ring copied ahead for a pass that did not come (the first ones, after the last one); the
+                # pages already dropped cost almost nothing
+                for entry in [entry for entry in self.blocks_of_modules if entry.split("/", 1)[0] == model_id]:
+                    _drop_mapped_pages(self._mapped_pages(entry))
 
         if self.auto_preload is not None:
             self.auto_preload.on_unload([model_id for model_id in self.active_models_ids if model_id not in keep])
@@ -6241,7 +6290,7 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         # through the ring, and push out the entries of the models that run many passes (a transformer, a language model), which then copy
         # them again. A model sets _mm_pinned_pool itself to choose (e.g. an autoregressive language model registered as a text encoder),
         # also at run time
-        for model_id in ("text_encoder", "text_encoder_2", "vae"):
+        for model_id in ONCE_PER_GENERATION_MODELS:
             if model_id in modules and getattr(modules[model_id], "_mm_pinned_pool", None) is None:
                 modules[model_id]._mm_pinned_pool = False
 

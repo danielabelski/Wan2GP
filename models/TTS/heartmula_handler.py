@@ -147,6 +147,7 @@ class family_handler:
             codec_guidance_scale=model_def.get("heartmula_codec_guidance_scale", 1.25),
             codec_version=model_def.get("heartmula_codec_version", ""),
             cuda_graphs=lm_features.graphs,
+            flash_attention=lm_features.flash,
         )
 
         pipeline.mula.decoder[0].layers._compile_me = False

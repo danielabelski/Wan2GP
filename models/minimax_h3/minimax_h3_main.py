@@ -159,7 +159,7 @@ def _qkv_layout(filenames, qkv_layout):
 
 
 def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleaved", pdd=False,
-                      pdd_num_steps=None, pdd_block_size=None, vdn=False, veda=False):
+                      pdd_num_steps=None, pdd_block_size=None, vdn=False, veda=False, vsa=False):
     checkpoint = probe_h3_checkpoint(filename)
     hybrid_ref2va_blocks = checkpoint.get("hybrid_ref2va_blocks")
     filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
@@ -180,12 +180,18 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     with init_empty_weights(include_buffers=True):
         transformer = MiniMaxH3Model(adaln_curve_grid=checkpoint["adaln_curve_grid"], time_embed_dim=checkpoint["time_embed_dim"], adaln_dtype=checkpoint["adaln_dtype"],
                                      hybrid_ref2va_blocks=hybrid_ref2va_blocks, pdd_num_steps=pdd_num_steps,
-                                     pdd_block_size=pdd_block_size, vdn=vdn, control_layers=control_layers,
+                                     pdd_block_size=pdd_block_size, vdn=vdn, vsa=vsa, control_layers=control_layers,
                                      control_in_dim=control_in_dim, dtype=dtype, device="meta")
         if veda:
             transformer.veda_attention = veda_policy
             for layer, block in enumerate(transformer.blocks):
                 block.attn.veda = VedaAttention(veda_policy, layer, device="meta")
+        if vsa:
+            from .vsa.attention import VSAAttention, VSAPolicy, read_fasth3_inference
+            fasth3_inference = read_fasth3_inference(filenames[0])
+            transformer.vsa_attention = VSAPolicy(fasth3_inference)
+            for layer, block in enumerate(transformer.blocks):
+                block.attn.vsa = VSAAttention(transformer.vsa_attention, layer)
     qkv_layout = _qkv_layout(filenames, qkv_layout)
     split_map = get_linear_split_map(transformer.attention_inner_size, qkv_layout=qkv_layout) if qkv_splitting and not any(path.lower().endswith(".gguf") for path in filenames) else None
     if split_map is not None:
@@ -201,6 +207,7 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     transformer.eval().requires_grad_(False)
     transformer.h3_checkpoint_info = checkpoint
     transformer.split_linear_modules_map = split_map
+    transformer.fasth3_inference = fasth3_inference if vsa else None  # the trained schedule and sparsity contract of a FastH3 student
     return transformer
 
 
@@ -290,8 +297,8 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
                   model_type="minimax_h3_fl2va", reference_mode=False, video_vae_filename=VIDEO_VAE_FILE,
                   audio_vae_filename=AUDIO_VAE_FILE, latent_upscaler_filename=os.path.join(LATENT_UPSCALER_FOLDER, LATENT_UPSCALER_FILE),
                   shared_h3_pipeline=None, qkv_layout="interleaved", pdd=False, pdd_num_steps=None, pdd_block_size=None, vdn=False, audio_only=False,
-                  fixed_prompt_filename=None, veda=False):
-    transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn, veda)
+                  fixed_prompt_filename=None, veda=False, vsa=False):
+    transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn, veda, vsa)
     if shared_h3_pipeline is None:
         text_encoder = _load_text_encoder(text_encoder_filename, dtype) if fixed_prompt_filename is None else None
         video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE)

@@ -137,6 +137,7 @@ class MiniMaxMusic3Pipeline:
             default_dtype=None,
             writable_tensors=False,
         )
+        self.condition_encoder._convertWeightsFloatTo = self.vocoder._convertWeightsFloatTo = None  # prepared in FP32: in FP16 (GPUs without BF16) the vocoder overflows
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(asset_paths["scheduler_dir"], local_files_only=True)
         self.tokenizer = AutoTokenizer.from_pretrained(asset_paths["tokenizer_dir"], local_files_only=True, use_fast=True)
         self.sample_rate = int(self.vocoder.config.sampling_rate)
