@@ -22,7 +22,7 @@ def _wgp_installed():
 
 
 CHOICES = [("Disabled: PyTorch (slowest, most precise)", "disabled"), ("Auto (best available)", "auto"),
-           (f"WGPKernels (recommended,{'installed' if _wgp_installed() else 'not installed'}, second fastest, precise)", "wgpkernels"),
+           (f"WGPKernels (recommended, {'installed' if _wgp_installed() else 'not installed'}, second fastest, precise)", "wgpkernels"),
            ("Triton (fast, less precise)", "triton"), ("Comfy Kitchen Kernels (fastest, least precise)", "kitchen")]
 _LABELS = {"wgpkernels": "WGPKernels", "kitchen": "Comfy Kitchen", "triton": "Triton"}
 _backend = "pytorch"
@@ -111,8 +111,9 @@ def _probe_wgpkernels():
         return None, "requires a GPU"
     if torch.version.hip is not None and not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1201"):
         return None, "requires an AMD RDNA4 GPU (gfx1201) with ROCm"
-    if torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0):
-        return None, "requires an NVIDIA GPU with compute capability 8.0 or newer"
+    # Turing (7.5) runs builds that include sm_75 code; on older builds the selftest below fails (no kernel image) and Auto moves on
+    if torch.version.hip is None and torch.cuda.get_device_capability() < (7, 5):
+        return None, "requires an NVIDIA GPU with compute capability 7.5 or newer"
     try:
         module = importlib.import_module("wgpkernels.int8")
         if module._lib is None:

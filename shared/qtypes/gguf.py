@@ -902,6 +902,7 @@ def _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, st
 
 
 def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    input_tensor = input_tensor.contiguous()
     out_features, in_features = shape
     rows = input_tensor.numel() // in_features
     step = max(128, _LLAMACPP_SLICE_BYTES // (4 * out_features + in_features * 9 // 8) // 128 * 128)
@@ -1828,7 +1829,7 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
                 dtype = _resolve_default_dtype(qweight._gguf_default_dtype, fallback=input.dtype)
                 return linear_fused(input, qweight._data, qweight._tensor_type.name, list(qweight._tensor_shape), self.bias, dtype, silu_mul)
         if silu_mul:
-            from shared.llm_engines.nanovllm.layers.activation import silu_mul as apply_silu_mul
+            from shared.llm_engines.lmgp.layers.activation import silu_mul as apply_silu_mul
             input = apply_silu_mul(input, use_triton=optimized)
         if isinstance(qweight, GGUFWeightTensor):
             return qweight.linear(input, bias=self.bias)
@@ -2138,6 +2139,13 @@ class QEmbedding(BaseQEmbedding):
                 self.scale_grad_by_freq,
                 self.sparse,
             )
+            return self._apply_embed_scale(output)
+        if (isinstance(qweight, QTensor) and getattr(qweight, "_data", None) is not None and qweight._data.dim() == 2
+                and tuple(qweight._scale.shape) == (qweight._data.shape[0], 1) and self.max_norm is None):
+            # Quanto per-row table: dequantize the looked-up rows only, as its dequantization does (scale * data), not the whole table
+            # (a 248K-token INT8 vocabulary is 2 GB in BF16 per call)
+            data = qweight._data[input]
+            output = qweight._scale[input] * (data.to(qweight._scale.dtype) if qweight.qtype.is_floating_point else data)
             return self._apply_embed_scale(output)
         return super().forward(input)
 

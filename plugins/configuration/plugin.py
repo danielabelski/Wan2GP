@@ -165,9 +165,9 @@ IMPLICIT_DYNAMIC_PROFILES = (1, 3, 3.5) # these profiles always enable dynamic p
 PRELOAD_MODES = [("Default", "default"), ("Dynamic", "dynamic"), ("Manual", "manual")]
 MEMORY_ADVICE = """**Profile 4 is recommended for most PCs.** It sends the main model to the GPU part by part while the GPU works: models larger than your VRAM still run, most of the VRAM stays free for long videos or large images, and the speed cost is small. *Reserved RAM* is memory set aside to make these transfers fast. Other programs cannot use it, so only part of your RAM is reserved.
 
-**For image models, use Profile 4 or 5 with a *Dynamic* or *Manual* VRAM Preload for faster generations.** Their steps are short, so the transfers set the speed. The *VRAM Preload* next to each memory profile (Profiles 0, 2, 4 and 5) keeps part of each model in VRAM: *Default* keeps the profile's choice; *Dynamic* keeps as much of the model as each generation leaves free and gives part of it back if VRAM runs short (it needs the MMGP Optimized VRAM Allocator); *Manual* keeps the amount set below it (8000 MB or more brings Flux close to Profile 1). Video steps are usually long enough to hide the transfers.
+**For image models, use Profile 4 or 5 with a *Dynamic* or *Manual* VRAM Preload for faster generations.** Their steps are short, so the transfers set the speed. The *VRAM Preload* next to each memory profile (Profiles 0, 2, 4 and 5) keeps part of each model in VRAM: *Default* keeps the profile's choice (*Dynamic* for Profile 0, none for Profiles 2, 4 and 5); *Dynamic* keeps as much of the model as each generation leaves free and gives part of it back if VRAM runs short (it needs the MMGP Optimized VRAM Allocator); *Manual* keeps the amount set below it (8000 MB or more brings Flux close to Profile 1). Video steps are usually long enough to hide the transfers.
 
-**Profile 0 adapts to your PC:** like profile 4, it sends each model to the GPU part by part, but no model keeps Reserved RAM for good: the model running gets it for its parts, which then reach the GPU at full speed, and it passes to the next model when you switch. Fast with much less RAM than the profiles that keep models in Reserved RAM, also for models larger than your VRAM. Its *VRAM Preload* can also keep part of each model in VRAM (*Dynamic*: as much as fits, like profile 3). The language models of Deepy and the prompt enhancer always use it, with *Dynamic* preload.
+**Profile 0 adapts to your PC:** like profile 4, it sends each model to the GPU part by part, but no model keeps Reserved RAM for good: the model running gets it for its parts, which then reach the GPU at full speed, and it passes to the next model when you switch. Fast with much less RAM than the profiles that keep models in Reserved RAM, also for models larger than your VRAM. By default its *VRAM Preload* also keeps as much of each model in VRAM as fits, like profile 3 (*Dynamic*); choose *Manual* for a fixed amount. The language models of Deepy and the prompt enhancer always use it, with *Dynamic* preload.
 
 **Profiles 1 and 3 enable Dynamic Preload automatically:** profile 1 uses profile 2's RAM policy, and profile 3 uses profile 4's. They keep as much of each model in VRAM as fits alongside the generation's working memory, streaming the remaining layers. **Profile 3 is the default for new audio configurations.** Profile 3+ has the same placement policy without reserved RAM. LM engines that require fixed weight addresses use uncaptured steps while layers can move; models with MMGP block graphs can retain those graphs during offloading.
 
@@ -382,16 +382,6 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.transformer_dtype_policy_choice = gr.Dropdown(choices=[("Auto (Best for Hardware)", ""), ("FP16", "fp16"), ("BF16", "bf16")], value=self.transformer_dtype_policy, label="Transformer Data Type (if available)")
                     self.mixed_precision_choice = gr.Dropdown(choices=[("16-bit only (less VRAM)", "0"), ("Mixed 16/32-bit (better quality)", "1")], value=self.server_config.get("mixed_precision", "0"), label="Transformer Engine Precision")
                     self.text_encoder_quantization_choice = gr.Dropdown(choices=self.text_encoder_quantization_choices, value=self.text_encoder_quantization, label="Text Encoder Quantization")
-                    self.lm_decoder_engine_choice = gr.Dropdown(
-                        choices=[
-                            ("Auto", ""),
-                            ("PyTorch: slow, compatible", "legacy"),
-                            ("Cuda Graph: up to x6 faster, whole LM will be loaded in VRAM", "cg"),
-                            ("vllm: up to x10 faster, whole LM will be loaded in VRAM, requires Triton & Flash Attention 2", "vllm"),
-                        ],
-                        value=self.server_config.get("lm_decoder_engine", ""),
-                        label="Language Models Decoder Engine (audio and music models with a language model; Prompt Enhancer and Deepy always use the fastest)",
-                    )
                     self.compile_choice = gr.Dropdown(choices=self.compile_choices, value=self.compile, label="Transformer Compilation (faster, but the first generation is slower and some GPUs/Models may not support it)", interactive=not self.args.lock_config)
                     self.boost_choice = gr.Dropdown(choices=[("ON", 1), ("OFF", 2)], value=self.boost, label="Boost Layers Offloading when CFG > 1 (~10% speedup for ~1GB VRAM)")
                     self.int8_kernels_choice = gr.Dropdown(choices=int8_backend.CHOICES, value=self.server_config.get("int8_kernels", "auto"), label="INT8 Math Kernels", info="Auto selects WGPKernels, then Comfy Kitchen, then Triton, then PyTorch; an unavailable choice behaves as Auto. Disabled uses PyTorch. Other fused kernels (VAE, attention normalization) also try the selected family first. Changes apply to the next generation without reloading weights.")
@@ -931,7 +921,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice, self.prevent_power_throttling_choice, self.compute_cache_choice, self.compute_cache_path_choice,
             self.quantization_choice, self.transformer_dtype_policy_choice, self.mixed_precision_choice,
-            self.text_encoder_quantization_choice, self.lm_decoder_engine_choice, self.compile_choice,
+            self.text_encoder_quantization_choice, self.compile_choice,
             self.depth_anything_v2_variant_choice,
             self.vae_config_choice, self.boost_choice, self.int8_kernels_choice, self.fp8_kernels_choice, self.kernel_precision_choice, self.attention_head_split_choice,
             self.video_profile_choice, self.image_profile_choice, self.audio_profile_choice, self.video_preload_choice, self.image_preload_choice, self.audio_preload_choice,
@@ -1028,7 +1018,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice, prevent_power_throttling_choice, compute_cache_choice, compute_cache_path_choice,
             quantization_choice, transformer_dtype_policy_choice, mixed_precision_choice,
-            text_encoder_quantization_choice, lm_decoder_engine_choice, compile_choice,
+            text_encoder_quantization_choice, compile_choice,
             depth_anything_v2_variant_choice,
             vae_config_choice, boost_choice, int8_kernels_choice, fp8_kernels_choice, kernel_precision_choice, attention_head_split_choice,
             video_profile_choice, image_profile_choice, audio_profile_choice, video_preload_choice, image_preload_choice, audio_preload_choice,
@@ -1159,7 +1149,6 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
             "image_save_path": image_save_path_choice, "audio_save_path": audio_save_path_choice, "mesh_save_path": mesh_save_path_choice,
             'workspace_storage_mode': workspace_storage_choice, 'workspaces_dir': workspaces_root_choice.strip() or 'workspaces', 'mcp_workspace_mode': mcp_workspace_mode_choice, 'mcp_port': mcp_port_choice, 'mcp_webui': mcp_webui_choice, 'mcp_workspace_visibility': mcp_workspace_visibility_choice, 'mcp_visual_inspection': mcp_visual_inspection_choice,
-            "lm_decoder_engine": lm_decoder_engine_choice,
             "compile": compile_choice, "profile": video_profile_choice,
             "video_profile": video_profile_choice, "image_profile": image_profile_choice, "audio_profile": audio_profile_choice,
             "video_preload_in_VRAM": video_preload_choice, "image_preload_in_VRAM": image_preload_choice, "audio_preload_in_VRAM": audio_preload_choice,
@@ -1309,7 +1298,6 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.set_global("default_profile_audio", new_server_config["audio_profile"])
         self.set_global("compile", new_server_config["compile"])
         self.set_global("text_encoder_quantization", new_server_config["text_encoder_quantization"])
-        self.set_global("lm_decoder_engine", new_server_config["lm_decoder_engine"])
         self.set_global("vae_config", new_server_config["vae_config"])
         self.set_global("boost", new_server_config["boost"])
         self.set_global("int8_kernels", new_server_config["int8_kernels"])

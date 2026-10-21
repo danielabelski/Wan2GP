@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from shared.llm_engines.nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
+from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
 from shared.prompt_enhancer.qwen35_vl import _prepare_multimodal_vllm_prompt
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
 

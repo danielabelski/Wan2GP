@@ -122,9 +122,10 @@ def ensure_loaded(module):
 
 
 def weights_resident(module):
-    """Whether a managed model's weights are all in VRAM now (loaded, no block streamed; expert banks aside): an MMGP graph stage
-    may then span several of its blocks (see cuda_graphs.run). Check it at each call: a dynamic preload can release blocks between
-    calls. Unmanaged modules: True."""
+    """Whether the weights of a managed module are all in VRAM now (its model loaded, none of the blocks under the module streamed; expert
+    banks aside): an MMGP graph stage that runs this module may then span several of its blocks (see cuda_graphs.run). For a submodule
+    (e.g. the language model of a larger model), only its own blocks count: blocks the stage never runs may stay out of VRAM. Check it at
+    each call: a dynamic preload can release blocks between calls. Unmanaged modules: True."""
     owner = _owner(module)
     if owner is None:
         return True
@@ -134,15 +135,16 @@ def weights_resident(module):
     names = _block_names.get(manager)
     if names is None:  # the blocks of a model are those of its profile
         names = _block_names[manager] = {}
-    blocks = names.get(model_id)
+    model = manager.models[model_id]
+    blocks = names.get((model_id, id(module)))
     if blocks is None:
-        prefix = model_id + "/"
-        blocks = names[model_id] = [name[len(prefix):] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix)]
+        prefix = model_id + "/" + ("" if module is model else next(name for name, m in model.named_modules() if m is module) + ".")
+        blocks = names[(model_id, id(module))] = [name[len(model_id) + 1:] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix)]
     preloaded = manager.preloaded_blocks_per_model[model_id]
     return all(name in preloaded for name in blocks)
 
 
-_block_names = weakref.WeakKeyDictionary()  # an offload manager -> model id -> the names of its blocks
+_block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks
 _tower_entries = weakref.WeakKeyDictionary()  # a tower (ModuleList) -> (model id, the entry name of each of its blocks)
 
 

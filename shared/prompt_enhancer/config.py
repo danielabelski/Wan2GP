@@ -72,9 +72,10 @@ def speculative_decoding_runtime(value):
 
 
 def block_drafters_supported() -> bool:
-    """DSpark and DFlash2 run on Triton and FlashAttention 2 (the LLM engine uses them whenever they are installed)."""
-    from shared.llm_engines.nanovllm.vllm_support import probe_vllm_runtime
-    return bool(probe_vllm_runtime()["supported"])
+    """DSpark and DFlash2 run on Triton and FlashAttention 2 (the LLM engine uses each one wherever it is supported)."""
+    from shared.llm_engines.lmgp.vllm_support import resolve_lm_features
+    features = resolve_lm_features()
+    return features.triton and features.flash
 
 
 def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=None):

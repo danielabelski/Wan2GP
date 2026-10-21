@@ -1697,8 +1697,8 @@ def report(path=None, label=None, snapshot_label="report"):
                                  "phase": peak_all["phase"], "process_peak_private_gb": None if process["peak_private"] is None else round(process["peak_private"] / GB, 3),
                                  "available_min_gb": None if peak_all["available_min"] is None else round(peak_all["available_min"] / GB, 2),
                                  "other_processes_at_peak_gb": None if peak_all["others_at_peak"] is None else round(peak_all["others_at_peak"] / GB, 2)},
-              "releases": releases, "pinned_by_owner": {owner: {"blocks": count, "gb": round(size / GB, 3), "files": _events.owner_files.get(owner, [])}
-                                                        for owner, (count, size) in _events.pinned_by_owner().items()},
+              "releases": releases, "pinned_by_owner": {owner: {"blocks": count, "gb": round(size / GB, 3), "pool_blocks": pooled.get(owner, 0), "files": _events.owner_files.get(owner, [])}
+                                                        for pooled in [_events.pooled_by_owner()] for owner, (count, size) in _events.pinned_by_owner().items()},
               "retained_frames": _retained_frames(), "ram_allocator": allocator_report, "events": _events.as_json(entries, rec.t0),
               "snapshots": rec.snapshots, "history": rec.history, "origins": origins[:200],
               "stacks": {str(stack_id): [_vram_debug._frame_text(code, line) for code, line in rec.stack_frames[stack_id][:40]] for stack_id in sorted(used) if stack_id >= 0}}
@@ -1883,7 +1883,9 @@ def summary(result):
     if result.get("retained_frames"):
         text.append(_retained_summary(result["retained_frames"]))
     if result.get("pinned_by_owner"):
-        text.append("Pinned RAM registered now, by model: " + ", ".join(f"{owner} {item['gb']:.2f} GiB ({item['blocks']} blocks" + (", from " + ", ".join(item["files"]) if item.get("files") else "") + ")"
+        text.append("Pinned RAM registered now, by model: " + ", ".join(f"{owner} {item['gb']:.2f} GiB ({item['blocks']} blocks"
+                                                                       + (f", {item['pool_blocks']} of them in the pinned pool" if item.get("pool_blocks") else "")
+                                                                       + (", from " + ", ".join(item["files"]) if item.get("files") else "") + ")"
                                                                        for owner, item in result["pinned_by_owner"].items()) + ".\n\n")
     if len(result.get("history", [])) > 1:
         text.append(_trend_summary(result["history"]))
@@ -1928,12 +1930,13 @@ def _trend_summary(history):
     labels = list(dict.fromkeys(label for entry in history for label in entry["classes"]))
     spans = {label: [entry["classes"].get(label, 0.0) for entry in history] for label in labels}
     changing = sorted((label for label in labels if max(spans[label]) - min(spans[label]) >= 0.1), key=lambda label: -abs(spans[label][-1] - spans[label][0]))[:6]
-    text = ["## RAM after each report since the start of the recording (GiB)\n\n| census | time (s) | private | resident | memory-mapped files resident | "
-            + " | ".join(changing) + " |\n|---|---:|---:|---:|---:|" + "---:|" * len(changing) + "\n"]
+    columns = ["census", "time (s)", "private", "resident", "memory-mapped files resident", *changing]
+    text = ["## RAM after each report since the start of the recording (GiB)\n\n| " + " | ".join(columns) + " |\n|---|" + "---:|" * (len(columns) - 1) + "\n"]
     for entry in history:
         mapped = entry.get("mapped_files_gb")
-        text.append(f"| {entry['label']} | {entry['time_s']:.0f} | {entry['private_gb']:.2f} | {entry['resident_gb']:.2f} | {'-' if mapped is None else f'{mapped:.2f}'} | "
-                    + " | ".join(f"{entry['classes'].get(label, 0.0):.2f}" for label in changing) + " |\n")
+        values = [entry["label"], f"{entry['time_s']:.0f}", f"{entry['private_gb']:.2f}", f"{entry['resident_gb']:.2f}", "-" if mapped is None else f"{mapped:.2f}",
+                  *(f"{entry['classes'].get(label, 0.0):.2f}" for label in changing)]
+        text.append("| " + " | ".join(values) + " |\n")
     text.append(f"\nChange since the start: private {last['private_gb'] - first['private_gb']:+.2f} GiB, resident {last['resident_gb'] - first['resident_gb']:+.2f} GiB.\n\n")
     previous = next((entry for entry in reversed(history[:-1]) if entry["census"] == last["census"]), None)
     if previous is None:

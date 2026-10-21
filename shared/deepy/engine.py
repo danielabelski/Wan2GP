@@ -6403,7 +6403,7 @@ class AssistantEngine:
                 engine_state = ""
         info = {
             "model_class": model.__class__.__name__,
-            "engine": str(getattr(model, "_prompt_enhancer_engine_name", "") or ""),
+            "llm_features": dict(getattr(model, "_prompt_enhancer_llm_features", None) or {}),
             "use_vllm": bool(getattr(model, "_prompt_enhancer_use_vllm", False)),
             "use_legacy_cuda_runner": bool(getattr(model, "_prompt_enhancer_use_legacy_cuda_runner", False)),
             "enable_cudagraph": bool(getattr(model, "_prompt_enhancer_enable_cudagraph", False)),

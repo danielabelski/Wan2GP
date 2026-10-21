@@ -474,7 +474,7 @@ class DeepyController:
                 engine._ensure_llm()
                 llm = getattr(engine, "_llm", None)
                 if llm is None:
-                    raise RuntimeError("Assistant NanoVLLM runtime is not available.")
+                    raise RuntimeError("Assistant LM engine runtime is not available.")
                 llm.model_runner.ensure_runtime_ready()
                 engine.release_runtime_allocations()
                 warmed_vllm = True

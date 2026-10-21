@@ -23,7 +23,7 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--save-speakers", action="store_true", help="save proprocessed audio track with extract speakers for debugging or editing")
     add("--debug-gen-form", action="store_true", help="View form generation / refresh time")
     add("--betatest", action="store_true", help="test unreleased features")
-    add("--vram-safety-coefficient", type=float, default=0.8, help="max VRAM (between 0 and 1) that should be allocated to preloaded models")
+    add("--vram-safety-coefficient", type=float, default=0.85, help="max VRAM (between 0 and 1) that should be allocated to preloaded models")
     add("--share", action="store_true", help="Create a shared URL to access webserver remotely")
     add("--lock-config", action="store_true", help="Prevent modifying the configuration from the web interface")
     add("--lock-model", action="store_true", help="Prevent switch models")

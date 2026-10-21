@@ -159,23 +159,28 @@ def pooled(owner, fn, *args, **kwargs):
     return graphs.pooled(fn, args, kwargs)
 
 
-def register_state(owner, name, tensors):
+def register_state(owner, name, tensors, holders=()):
     """Tensors that the graphs of owner's model read or update in place besides its weights and arguments (caches, recurrent states,
     buffers its loop fills before each call), at fixed addresses until release_state: never copied, whatever the allocator, and allowed
-    by the read check. A new registration under the same name replaces the previous one and drops the model's graphs."""
+    by the read check. holders: objects holding these tensors that blocks take as arguments (e.g. a transformers StaticCache passed to
+    every layer), keyed by their identity and passed as they are. A new registration under the same name replaces the previous one and
+    drops the model's graphs."""
     graphs = _graphs(owner)
     if graphs is None:
         return
     if _recording:
         raise RuntimeError("CUDA graph state must be registered before its graphs are prepared or captured")
     tensors = tuple(t for t in tensors if type(t) is torch.Tensor and t.is_cuda)  # plain tensors: subclasses (weights) are not state
-    previous = graphs.state.get(name)
-    if previous is not None and len(previous) == len(tensors) and all(a is b for a, b in zip(previous, tensors)):
+    holders = tuple(holders)
+    previous, previous_holders = graphs.state.get(name), graphs.holders.get(name, ())
+    if (previous is not None and len(previous) == len(tensors) and all(a is b for a, b in zip(previous, tensors))
+            and len(previous_holders) == len(holders) and all(a is b for a, b in zip(previous_holders, holders))):
         return
     if previous is not None:
         graphs.clear()
-    graphs.state[name] = tensors
+    graphs.state[name], graphs.holders[name] = tensors, holders
     graphs.state_ids = {id(t) for state in graphs.state.values() for t in state}
+    graphs.holder_ids = {id(h) for state in graphs.holders.values() for h in state}
 
 
 def release_state(owner, name=None):
@@ -185,9 +190,12 @@ def release_state(owner, name=None):
         return
     if name is None:
         graphs.state.clear()
+        graphs.holders.clear()
     elif graphs.state.pop(name, None) is None:
         return
+    graphs.holders.pop(name, None)
     graphs.state_ids = {id(t) for state in graphs.state.values() for t in state}
+    graphs.holder_ids = {id(h) for state in graphs.holders.values() for h in state}
     graphs.clear()
 
 
@@ -357,7 +365,7 @@ def _flatten(tree):
             _register_dataclass(cls)
 
 
-def _signature(leaves):
+def _signature(leaves, holders=frozenset()):
     signature = []
     for leaf in leaves:
         if isinstance(leaf, torch.Tensor):
@@ -366,6 +374,8 @@ def _signature(leaves):
             signature.append(leaf)
         elif isinstance(leaf, slice):
             signature.append(("slice", leaf.start, leaf.stop, leaf.step))
+        elif id(leaf) in holders:  # an object holding registered state (register_state): the same object, its tensors in place
+            signature.append(("state", id(leaf)))
         else:
             raise TypeError(f"CUDA graph block call: an argument of type {type(leaf).__name__} is not supported, pass its tensors as arguments")
     return tuple(signature)
@@ -500,16 +510,20 @@ def _execute_lifetimes(forward, args, kwargs, positions, leaves):
 class BlockGraphs:
     """CUDA graphs of the tower blocks of one model."""
 
-    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready):
+    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None):
         # extra_inputs(block) -> [(list, index)]: tensors read by the block that are neither weights nor arguments, read by its graphs from
-        # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move
+        # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move; forget(): the
+        # graphs are gone, so are the records that weights_key keeps on the blocks
         self.name, self.weights_key, self.weight_tensors, self.extra_inputs, self.ready = name, weights_key, weight_tensors, extra_inputs, ready
+        self.forget = forget
         self.disabled = None  # the reason why this model's blocks run eagerly (e.g. weights whose kernels cannot be captured), or None
         self.reported = False
         self.checked = set()  # (block, method, signature) whose capture checked the reads
         self.blas = {}  # (block, method, signature) -> whether its eager warmup used cuBLAS (its capture stream then needs the workspaces)
         self.state = {}  # name -> tensors that the graphs read besides weights and arguments (register_state): kept across clear()
         self.state_ids = set()  # their ids
+        self.holders = {}  # name -> the objects holding these tensors that blocks take as arguments
+        self.holder_ids = set()  # their ids
         self.clear()
         _managers.append(self)
 
@@ -522,6 +536,8 @@ class BlockGraphs:
         self.spans, self.span_runs = {}, {}  # (tower, start, stop, step) -> _Span; (tower, step) -> the runs its spans were made for
         self.memo = {}  # (module, its first argument) -> its last call replayed through the fast path of call()
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
+        if self.forget is not None:
+            self.forget()
 
     def span(self, blocks, start, stop, step, runs):
         # the stage of a run of blocks kept in VRAM; when the runs change, the stages of the runs gone leave with their graphs
@@ -578,7 +594,7 @@ class BlockGraphs:
                         leaf.copy_(static)
                 return result
         leaves, spec = _flatten((args, kwargs))
-        signature = _signature(leaves)
+        signature = _signature(leaves, self.holder_ids)
         extras = self.extra_inputs(module)
         extra_signature = _signature([holder[index] for holder, index in extras])
         positions = [index for index, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]

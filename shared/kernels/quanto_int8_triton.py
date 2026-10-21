@@ -53,7 +53,7 @@ _HIGH_SHARED_MEMORY_CONFIG = (64, 256, 64, 8, 4)
 _HIGH_SHARED_MEMORY_CONFIG_BYTES = 102400
 _LOW_SHARED_MEMORY_CONFIG = (64, 256, 64, 8, 3)
 
-# Tuned decode-time configs reused from nanovllm int8 kernels.
+# Tuned decode-time configs reused from the LM engine's int8 kernels.
 _TRITON_SMALL_M_CONFIGS = {
     (2048, 4096): (2, 32, 256, 8, 5),
     (2048, 2048): (1, 32, 64, 2, 4),

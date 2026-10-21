@@ -387,12 +387,18 @@ class _PinningCopier:
     def copy(self, dst, source, length):
         futures = self.blocks[next(reversed(self.blocks))]
         holder, left = [source], [(length + STAGING_CHUNK_SIZE - 1) // STAGING_CHUNK_SIZE]
+        # a source mapped from a checkpoint: its pages leave the working set once copied, rather than when its whole view of the file is
+        # released (the end of the pinning, or never if a part of the view is not pinned)
+        start, end = (source.data_ptr() + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE, (source.data_ptr() + length) // PAGE_SIZE * PAGE_SIZE
+        mapped = [(start, end)] if os.name == "nt" and end > start and not _private_memory([source.data_ptr()])[0] else None
         def copied(_):
             with self.lock_guard:
                 left[0] -= 1
                 done = left[0] == 0
             if done:
                 holder.clear()
+                if mapped:
+                    _drop_mapped_pages(mapped)
         for offset in range(0, length, STAGING_CHUNK_SIZE):
             future = self.executor.submit(ctypes.memmove, dst + offset, source.data_ptr() + offset, min(STAGING_CHUNK_SIZE, length - offset))
             future.add_done_callback(copied)
@@ -887,6 +893,7 @@ CPU_COMPUTE_CLIMB_GAIN = 0.01 # cpuCompute: a count of streamed blocks replaces 
 CPU_COMPUTE_RECHECK = 256 # cpuCompute: short calls after which a settled choice is tried again (a count of streamed blocks against its neighbours, the CPU after it was slower than the transfers)
 BASE_SMALL_MODULE_SIZE = STAGING_MIN_SIZE # modules of the blocks of the towers with fewer bytes of their own join the base of their model (0: none)
 BASE_SMALL_MODULES_SHARE = 0.05 # unless they weigh more than this share of the towers
+BASE_BLOCKS_OUTSIDE_TOWERS = False # in a model with main towers, the blocks outside them (a Sequential, a list of fewer layers than a tower) join its base
 _pcie_bytes_per_second = None
 
 
@@ -1180,6 +1187,17 @@ if os.name == "nt":
     _virtual_query = ctypes.WinDLL("kernel32", use_last_error=True).VirtualQuery
     _virtual_query.argtypes = (ctypes.c_void_p, ctypes.POINTER(_MemoryInformation), ctypes.c_size_t)
     _virtual_query.restype = ctypes.c_size_t
+    _virtual_unlock = ctypes.WinDLL("kernel32", use_last_error=True).VirtualUnlock
+    _virtual_unlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+
+def _drop_mapped_pages(ranges):
+    # the pages of a checkpoint mapping that a copy has read stay in the process' working set beside the copy, counted as used RAM, until
+    # Windows trims them under pressure (a read-only mapping included): dropped at once (VirtualUnlock on pages that are not locked), they
+    # wait on the standby list, available, and come back without reading the drive if the mapping is read again soon. On Linux the available
+    # memory already counts the pages of mapped files.
+    if os.name == "nt":
+        for start, end in ranges:
+            _virtual_unlock(start, end - start)
 
 def _private_memory(pointers):
     # whether each address (in increasing order) lies in RAM the process allocated (PyTorch's allocators, the heap), rather than in a mapping
@@ -1223,7 +1241,8 @@ class _PoolEntry:
 # How a block enters the pinned pool, made once for its layout: the page ranges to lock in place [(start, end, storages)] and their sources
 # [(offset in the block's VRAM buffer, uint8 tensor)], the runs copied into a buffer of locked RAM of its own (_copy_runs), the size of that
 # buffer, its pieces [(offset in the VRAM buffer, offset in the buffer, bytes)], the bytes locked and the plain tensors as (address, bytes)
-_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves")
+_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped") # mapped: the whole pages of the
+# tensors mapped from a checkpoint file [(start, end)], dropped from the working set once copied
 
 
 class _PinnedPool:
@@ -1285,11 +1304,13 @@ class _PinnedPool:
             for leaf in _staging_leaves(t):
                 leaves.setdefault((leaf.data_ptr(), leaf.numel() * leaf.element_size()), leaf)
         keys = sorted(leaves)
-        ranges, in_place, copied = [], [], [] # [start, end, storages]; [offset in the VRAM buffer, address, bytes, storage]; (address of the tensor, of the part, bytes)
+        ranges, in_place, copied, mapped = [], [], [], [] # [start, end, storages]; [offset in the VRAM buffer, address, bytes, storage]; (address of the tensor, of the part, bytes)
         for key, private in builtins.zip(keys, _private_memory([pointer for pointer, _ in keys])):
             start, end = (key[0] + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE, (key[0] + key[1]) // PAGE_SIZE * PAGE_SIZE
             if not private or end <= start:
                 copied.append((key[0], key[0], key[1]))
+                if not private and end > start:
+                    mapped.append((start, end))
                 continue
             storage = leaves[key].untyped_storage()
             if ranges and start == ranges[-1][1]:
@@ -1315,7 +1336,7 @@ class _PinnedPool:
         pieces = merged([[layout[1][pointer] + part - pointer, offsets[part], nbytes, None] for pointer, part, nbytes in copied], lambda a, b: True)
         copy_nbytes = (copy_nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE if copied else 0
         return _PoolPlan(layout, [(start, end, storages) for start, end, storages in ranges], sources, runs, copy_nbytes, [tuple(piece[:3]) for piece in pieces],
-                         builtins.sum(end - start for start, end, _ in ranges) + copy_nbytes, tuple(keys))
+                         builtins.sum(end - start for start, end, _ in ranges) + copy_nbytes, tuple(keys), mapped)
 
     def prepare(self, manager, model_id, entry_name, plan):
         """The future of a block's entry, made on the pool's thread from its plan: True once it is in, False if it could not enter."""
@@ -1345,6 +1366,7 @@ class _PinnedPool:
                     if plan.copy_nbytes:
                         buffer, owner = _pinned_block(plan.copy_nbytes)
                         _copy_runs(buffer.data_ptr(), plan.runs, self.helpers)
+                        _drop_mapped_pages(plan.mapped)
                         registration = _HostRegistration(owner, buffer.data_ptr(), plan.copy_nbytes, device)
                         if int(registration.register()) == 0:
                             registrations.append(registration)
@@ -3732,7 +3754,7 @@ class offload:
         self.shuttle_sizes = {} # model id -> size of the largest block of its towers
         self.learned_links = set() # blocks whose next block is the one that came next when they last ran: the ends of the towers
         self.auto_preload = None # with autoPreload, the plans of the models whose preload follows the VRAM left by their workloads
-        self.auto_preload_requested = False
+        self.auto_preload_requested = self.preload_plans = False
         self.cuda_graphs = {} # model id -> the CUDA graphs of the blocks of its towers (cudaGraphs)
         self.expert_residency = {}
         self.expert_hooks = []
@@ -3876,7 +3898,7 @@ class offload:
                 consumer.wait_event(transfer if isinstance(transfer, torch.cuda.Event) else transfer.result())
             else:
                 self._transfer(consumer, entry_name, cpu_to_gpu)
-        next_entry, window, seen = entry_name, self.prefetch_windows[model_id], {entry_name}
+        next_entry, window, seen, wanted = entry_name, self.prefetch_windows[model_id], {entry_name}, []
         while window > 0:
             prev_entry, next_entry = next_entry, self.next_blocks_names.get(next_entry, None)
             if next_entry is None or next_entry in seen or prev_entry in self.learned_links and self.blocks_of_modules_sizes[next_entry] > self.shuttle_sizes[model_id]:
@@ -3885,6 +3907,13 @@ class offload:
             if short and next_entry not in streamed:
                 continue
             window -= 1
+            wanted.append(next_entry)
+        # a block transferred ahead that the calls did not take (another block came next) would keep its slot from the next blocks, whose
+        # copies would then get buffers of their own (new tensors at each transfer: their CUDA graphs captured again): it goes back
+        prefix = model_id + "/"
+        for stale in [entry for entry in self.inflight if entry.startswith(prefix) and entry not in wanted]:
+            self.gpu_unload_blocks(model_id, stale[len(prefix):])
+        for next_entry in wanted:
             if next_entry not in self.inflight:
                 if self.verboseLevel >= 2:
                     tqdm.write(f"Prefetching model {next_entry} ({self.models[model_id]._get_name()}) in GPU")
@@ -3923,8 +3952,10 @@ class offload:
         else:
             region, items, (_, offsets, nbytes) = staged
         slot = self._take_slot(entry_name, nbytes) if CACHED_BLOCK_VIEWS else None
+        model_id, block_name = entry_name.split("/", 1)
+        adopted = self.adopt_slot(model_id, nbytes) if slot is None and self.auto_preload is not None and self.auto_preload.keeps_all(model_id, block_name) else None
         with torch.cuda.stream(stream):
-            buffer = torch.empty(nbytes, dtype=torch.uint8, device="cuda") if slot is None else self.block_slots[entry_name.split("/", 1)[0]][slot][0]
+            buffer = self.block_slots[model_id][slot][0] if slot is not None else adopted if adopted is not None else torch.empty(nbytes, dtype=torch.uint8, device="cuda")
             if staged is None:
                 for offset, source in sources:
                     buffer[offset:offset + source.numel()].copy_(source, non_blocking=True)
@@ -3965,6 +3996,26 @@ class offload:
                 slot[1] = entry_name
                 return slot_no
         return None
+
+    def adopt_slot(self, model_id, nbytes, entry_name=None):
+        """A slot of the streamed blocks of a model that leaves the rotation to become the buffer of a block kept in VRAM, while every block
+        of the model is to be kept: the slots would serve no streamed block any more, the kept blocks take their memory instead of new
+        buffers beside them. entry_name: the slot holding that block, otherwise (None) an idle one, for a block of nbytes at least 3/4 of the
+        slot's size (the slots are sized for the largest block: a much smaller block would leave most of it unused). Returns its buffer,
+        None if there is none."""
+        slots = self.block_slots.get(model_id)
+        if not slots:
+            return None
+        fits = lambda slot: slot[0] is not None and 3 * slot[2] <= 4 * nbytes <= 4 * slot[2]
+        slot_no = next((i for i, slot in enumerate(slots) if slot[1] == entry_name and fits(slot)), None)
+        if slot_no is None:
+            return None
+        buffer = slots.pop(slot_no)[0]
+        # the numbers of the slots that follow change: their views are rebuilt when used
+        self.slot_views = {key: views for key, views in self.slot_views.items() if not key[0].startswith(model_id + "/")}
+        if not slots:
+            del self.block_slots[model_id]  # made again, sized for the streamed blocks, if a later plan streams some
+        return buffer
 
     def _free_slot(self, entry_name):
         slots = self.block_slots.get(entry_name.split("/", 1)[0], None)
@@ -4036,7 +4087,7 @@ class offload:
                     towers.append([(name, self.blocks_of_modules_sizes[model_id + "/" + name]) for _, name in floors])
                 ranking = ranked_blocks(towers)
             else:
-                ranking = plan.ranking
+                ranking = plan.ranking[len(plan.others):]  # the blocks outside the towers come first in _pool_others
             cached = self.pool_ranked[model_id] = (len(preloaded), [model_id + "/" + name for name in reversed(ranking) if name not in preloaded])
         return cached[1]
 
@@ -4063,15 +4114,15 @@ class offload:
         auto = None if self.auto_preload is None else self.auto_preload.plans.get(model_id)
         if auto is not None and (auto.measuring or auto.pending):
             return ()
-        limit = self._pool_limit(model_id)
-        key = (len(self.preloaded_blocks_per_model[model_id]), limit, _pool.epoch, _pool.full)
+        limit, admits = self._pool_limit(model_id), self._pool_admits(model_id)
+        key = (len(self.preloaded_blocks_per_model[model_id]), limit, _pool.epoch, _pool.full, admits)
         cached = self.pool_wanted.get(model_id)
         if cached is None or cached[0] != key:
             ranked, others = self._pool_ranked(model_id), self._pool_others(model_id)
             wanted = {entry for entry in others + ranked if _pool.involved(self, entry)}
             room = self.max_reservable_memory - total_pinned_bytes - _pool.reserved()
             for entry in others + ranked[:limit]:
-                if _pool.full or entry in wanted or not self.needs_staging(entry): # a block pinned for good needs no entry
+                if not admits or _pool.full or entry in wanted or not self.needs_staging(entry): # a block pinned for good needs no entry
                     continue
                 size = self._pool_plan(entry).nbytes
                 if size <= room:
@@ -4080,15 +4131,22 @@ class offload:
             cached = self.pool_wanted[model_id] = (key, wanted)
         return cached[1]
 
+    def _pool_admits(self, model_id):
+        # whether new blocks of a model may enter the pinned pool: its _mm_pinned_pool, read at each load and block so that it may change at
+        # run time (profile() sets the defaults of its models)
+        return getattr(self.models[model_id], "_mm_pinned_pool", True)
+
     def _pool_need(self, model_id):
-        # bytes the pinned pool may lock for the blocks of a model out of VRAM: those it does not hold yet, and all of them
+        # bytes the pinned pool may lock for the blocks of a model out of VRAM: those it does not hold yet, and all of them (only those it
+        # holds when it may not take more)
         need = whole = 0
         if model_id in self.pool_models:
+            admits = self._pool_admits(model_id)
             for entry in self._pool_others(model_id) + self._pool_ranked(model_id)[:self._pool_limit(model_id)]:
                 held = _pool.entry(self, entry)
                 if held is not None:
                     whole += held.nbytes
-                elif self.needs_staging(entry): # not pinned for good
+                elif admits and self.needs_staging(entry): # not pinned for good
                     size = self._pool_plan(entry).nbytes
                     whole, need = whole + size, need + (0 if _pool.involved(self, entry) else size)
         return need, whole
@@ -4299,6 +4357,13 @@ class offload:
             state = module._mm_graph_state = [adapters, holders, loras, None, None]
         return state
 
+    def _graph_forget(self, model):
+        # the graphs of the model are gone: so are the holders of the tensors of its blocks, kept for their keys. A block may have dropped
+        # submodules since they were made (e.g. the KV caches of a generation), whose memory they would otherwise keep
+        for module in model.modules():
+            module.__dict__.pop("_mm_graph_state", None)
+            module.__dict__.pop("_mm_graph_placement", None)
+
     def _graph_weights_key(self, model, module):
         """What a block's graph depends on besides its arguments and LoRA copies: its parameters and buffers, the active adapters and their
         scalings. A block loaded elsewhere gets new tensor objects (and the caches made on them, e.g. converted scales): the key is their serial
@@ -4457,10 +4522,19 @@ class offload:
             cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
             torch.cuda.synchronize()
         if not preload:
-            self.loaded_blocks[model_id] = blocks_name           
+            self.loaded_blocks[model_id] = blocks_name
+        if model_id in self.pool_models and not self._pool_admits(model_id):
+            # a model kept out of the pinned pool runs once or twice per generation (a text encoder): the checkpoint pages its transfer read
+            # leave the working set at once, available to the other models rather than counted as used until Windows trims them
+            _drop_mapped_pages(self._pool_plan(entry_name).mapped)
 
         # cl.stop()
         # print(f"load time: {cl.format_time_gap()}")
+
+    def block_in_vram(self, model_id, blocks_name):
+        # whether a block's tensors are all in VRAM: they are installed one by one, its last one last (a block being transferred is not; a
+        # block whose small modules all joined the base has none)
+        return builtins.all(getattr(parent_module, n).is_cuda for parent_module, n, *_ in self.blocks_of_modules[model_id + "/" + blocks_name][-1:])
 
     @torch.compiler.disable()
     def gpu_unload_blocks(self, model_id, blocks_name):
@@ -4512,11 +4586,15 @@ class offload:
         self.active_models.append(model)
         self.active_models_ids.append(model_id)
         runtime._load_resources(self, model_id)
+        if self.auto_preload is not None:
+            self.auto_preload.on_load(model_id)
         for block_name in [None, *self.preloaded_blocks_per_model[model_id]]:
             # Allocation pressure can shrink the automatic preload even while this loop is copying it.
             if block_name is not None and block_name not in self.preloaded_blocks_per_model[model_id]:
                 continue
             self.gpu_load_blocks(model_id, block_name, True)
+            if block_name is not None and block_name not in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_unload_blocks(model_id, block_name)  # left out of the preload by an allocation of its own transfer
 
     def unload_all(self, *, keep=()):
         self.wait_prefetch()
@@ -4531,7 +4609,7 @@ class offload:
         for model_id in self.active_models_ids:
             if model_id in keep:
                 continue
-            self.gpu_unload_blocks(model_id, None)      
+            self.gpu_unload_blocks(model_id, None)
             for block_name in self.preloaded_blocks_per_model[model_id]:
                 self.gpu_unload_blocks(model_id, block_name)
 
@@ -5103,6 +5181,29 @@ class offload:
         if self.verboseLevel >= 2:
             print(f"Model '{model_id}': {builtins.sum(len(small) for _, small, _ in plan)} small modules of its blocks ({moved_size/ONE_MB:0.1f} MB) kept in VRAM with the model")
 
+    def _shared_tensors_to_base(self, model_id):
+        """The tensors that modules of different blocks share (e.g. one rotary table for every layer) join the base of the model: streamed
+        with the first block that holds them, the other blocks would keep reading that block's copy once its memory goes to the next
+        streamed block."""
+        nbytes = lambda p: _subtensors_nbytes(sub_tensors) if (sub_tensors := _get_quantized_subtensors(p)) else p.data.nbytes
+        entries = [entry for entry in self.blocks_of_modules if entry.startswith(model_id + "/")]
+        owners = {(item[0], item[1]): entry for entry in entries for item in self.blocks_of_modules[entry] if item[4] is None}
+        shared = {item[4] for entry in entries for item in self.blocks_of_modules[entry] if item[4] is not None and owners.get(item[4], entry) != entry}
+        if not shared:
+            return
+        base, moved_size = self.blocks_of_modules.setdefault(model_id, []), 0
+        for entry in entries:  # the owner of a tensor comes first: its block precedes the blocks that share it
+            moved = [item for item in self.blocks_of_modules[entry] if (item[0], item[1]) in shared or item[4] in shared]
+            if moved:
+                size = builtins.sum(nbytes(item[2]) for item in moved if item[4] is None)
+                base += moved
+                self.blocks_of_modules[entry] = [item for item in self.blocks_of_modules[entry] if (item[0], item[1]) not in shared and item[4] not in shared]
+                self.blocks_of_modules_sizes[entry] -= size
+                moved_size += size
+        self.blocks_of_modules_sizes[model_id] = self.blocks_of_modules_sizes.get(model_id, 0) + moved_size
+        if self.verboseLevel >= 2:
+            print(f"Model '{model_id}': {len(shared)} tensors shared by several of its blocks ({moved_size/ONE_MB:0.1f} MB) kept in VRAM with the model")
+
     def _split_cpu_compute(self, model_id, towers_names):
         """cpuCompute: the blocks of the towers keep the large weights that a CPU kernel computes in their storage; their other parameters and
         buffers join the base of the model, in VRAM whenever it is loaded. A model with a large tensor in its blocks that no CPU kernel computes
@@ -5275,7 +5376,7 @@ def {fname}(module, *args, **kwargs):
                     if timed:
                         self._cpu_measure(model_id, blocks_name, rows, time.perf_counter() - start)
             check_load_into_GPU_needed_module = check_load_into_GPU_needed_cpu
-        if self.auto_preload_requested and blocks_name is not None:
+        if self.preload_plans and blocks_name is not None:
             check_load_into_GPU_needed_plain = check_load_into_GPU_needed_module
             def check_load_into_GPU_needed_auto(module, *args, **kwargs):
                 if self.auto_preload is not None: # the plan of a cycle is set as it starts, before its first block is loaded
@@ -5517,7 +5618,7 @@ class LoadingCallback:
         self.check_abort()
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False):
     """Configure offloading, optionally reporting phases and accepting cancellation."""
     global total_pinned_bytes, max_pinnable_bytes, last_offload_obj
     kwargs = locals().copy()
@@ -5538,7 +5639,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         raise error from None
 
 
-def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False):
+def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -5554,7 +5655,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         placing them is a plain transfer; the experts that stay on the CPU are never pinned.
         (in fact the real usage is twice this number). It is very efficient to reduce VRAM consumption but this feature may be very slow
         if pinnedMemory is not enabled
-    vram_safety_coefficient: float between 0 and 1 (exclusive), default 0.8. Sets the maximum portion of VRAM that can be used for models.
+    vram_safety_coefficient: float between 0 and 1 (exclusive), default 0.85. Sets the maximum portion of VRAM that can be used for models.
         Lower values provide more safety margin but may reduce performance.        
     prefetchWindow: with asyncTransfers, number of blocks transferred ahead of the block being computed. None (default): 2 for the models whose
         budget also preloads blocks, 1 for the others. The host queues the copies without waiting for the GPU, which orders them after the
@@ -5642,7 +5743,9 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     elif autoPreload and not asyncTransfers:
         print("Automatic VRAM preload needs asynchronous transfers (the blocks are kept as they are transferred ahead): the budgets apply")
     self.auto_preload_requested = bool(autoPreload) and asyncTransfers # the plans are made of blocks transferred ahead
-    auto_models = []
+    # without it, the blocks of a budget's preload leave the VRAM under pressure instead of the allocation spilling into RAM (MMGP allocator)
+    self.preload_plans = self.auto_preload_requested or vram_allocator.active == "vmm" and asyncTransfers
+    auto_models, fixed_models = [], []
 
 
 
@@ -5746,13 +5849,17 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         model_dtype = getattr(current_model, "_model_dtype", None)
         # if model_dtype == None:
         #     model_dtype = getattr(current_model, "dtype", None)
+        counted = set() # a tensor held by several parameters (e.g. an embedding shared by two heads) is counted once
         for _ , m in current_model.named_modules():
             ignore_dtype = hasattr(m, "_lock_dtype")
             for n, p in m.named_parameters(recurse = False):
                 p.requires_grad = False
                 sub_tensors = _get_quantized_subtensors(p)
                 if sub_tensors:
-                    current_model_size += _subtensors_nbytes(sub_tensors)
+                    ref = _get_tensor_ref(p)
+                    if ref not in counted:
+                        counted.add(ref)
+                        current_model_size += _subtensors_nbytes(sub_tensors)
                     del sub_tensors
                 else:
                     if not ignore_dtype:
@@ -5768,7 +5875,9 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                             if model_dtype != dtype:
                                 pass
                             assert model_dtype == dtype
-                    current_model_size +=  torch.numel(p.data) * p.data.element_size()
+                    if p.data_ptr() not in counted: # after a conversion, which gives the parameter a copy of its own
+                        counted.add(p.data_ptr())
+                        current_model_size +=  torch.numel(p.data) * p.data.element_size()
         if model_dtype is None:
             model_dtype = model_convertWeightsFloatTo if model_convertWeightsFloatTo is not None else torch.bfloat16
         current_model._dtype = model_dtype
@@ -5820,17 +5929,36 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         # Short recurrent stacks can explicitly join the graph/offload plan so their larger blocks do not discard the fixed weight slots.
         graph_towers = getattr(current_model, "_cuda_graph_towers", ()) if cudaGraphs is True or model_id in graphed_models else ()
         towers_names, towers_modules = _detect_main_towers(current_model, extra_towers=graph_towers)
+        # modules kept with the base of the model, never streamed as blocks: their weights are read outside their forward (e.g. the
+        # codebooks of a vector quantizer looked up by index)
+        base_modules = tuple(getattr(current_model, "_offload_base_modules", ()))
+        in_base = lambda name: builtins.any(name == base or name.startswith(base + ".") for base in base_modules)
+        # modules used by several modules (e.g. one rotary embedding for all the layers) join the base too: streamed with the first block
+        # that holds them, their hooks would load that block again from the others. Not the lists and the modules holding lists: a list of
+        # layers held twice, a layer in two lists, a model held by a wrapper too (an alias) keep their blocks.
+        containers = (torch.nn.ModuleList, torch.nn.Sequential, torch.nn.ModuleDict)
+        parents = collections.Counter(child for module in current_model.modules() if not isinstance(module, containers)
+                                      for child in module._modules.values() if child is not None and not isinstance(child, containers))
+        shared_modules = {sub for module, count in parents.items() if count > 1 and not builtins.any(isinstance(sub, containers) for sub in module.modules())
+                          for sub in module.modules()}
+        if base_modules:
+            names_of = {module: name for name, module in current_model.named_modules()}
+            towers_names, towers_modules = [name for name in towers_names if not in_base(name.rstrip("."))], [module for module in towers_modules if not in_base(names_of[module])]
         compilationInThisOne = compileAllModels or model_id in modelsToCompile
         graphs = None
         if (cudaGraphs is True or model_id in graphed_models) and towers_modules:
             from .cuda_graphs import BlockGraphs
             graphs = self.cuda_graphs[model_id] = BlockGraphs(model_id, functools.partial(self._graph_weights_key, current_model), functools.partial(self._graph_weight_tensors, current_model),
-                                                              functools.partial(self._graph_lora_inputs, current_model), functools.partial(self._graph_ready, model_id))
+                                                              functools.partial(self._graph_lora_inputs, current_model), functools.partial(self._graph_ready, model_id),
+                                                              functools.partial(self._graph_forget, current_model))
             towers_set = set(towers_modules)
 
         loading_phase("Hooks and LoRA Slots", model_id)
         current_budget = raise_budget(current_model._budget) if hasattr(current_model, "_budget") else model_budgets[model_id]
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
+        # BASE_BLOCKS_OUTSIDE_TOWERS: the blocks outside the main towers of a model that has some (a Sequential, a list of fewer layers than a
+        # tower: embeddings, heads, refiners) join its base, loaded with the model rather than streamed at each pass
+        floors, in_tower = set(towers_modules) if BASE_BLOCKS_OUTSIDE_TOWERS else (), False
         self.loaded_blocks[model_id] = None
         any_lora =  loras !=None and model_id in loras
         if any_lora: 
@@ -5857,7 +5985,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                         pre , num = _extract_num_from_str(level)
                         if num != cur_blocks_seq and not (is_mod_seq and cur_blocks_seq>=0):
                             prev_blocks_name = cur_blocks_name
-                            cur_blocks_name =  cur_blocks_prefix + str(num)
+                            cur_blocks_name, in_tower =  cur_blocks_prefix + str(num), submodule in floors
                             # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
                         cur_blocks_seq = num
                     else:
@@ -5869,10 +5997,11 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_seq, is_mod_seq = pre + ".", None, -1, isinstance(submodule, torch.nn.Sequential)
                     elif num >=0:
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_seq, is_mod_seq = pre, None, num, False
-                        cur_blocks_name = submodule_name
+                        cur_blocks_name, in_tower = submodule_name, submodule in floors
                         # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
             separate = next((name for name in separate_blocks if submodule_name == name or submodule_name.startswith(name + ".")), None)
-            blocks_name, previous_name = (separate, None) if separate is not None else (cur_blocks_name, prev_blocks_name)
+            blocks_name, previous_name = (separate, None) if separate is not None else (None, None) if submodule in shared_modules or base_modules and in_base(submodule_name) \
+                or floors and cur_blocks_name is not None and not in_tower else (cur_blocks_name, prev_blocks_name)
             top_submodule = len(submodule_name.split("."))==1
             offload_hooks = submodule._offload_hooks if hasattr(submodule, "_offload_hooks") else []
             assert top_submodule or len(offload_hooks) == 0, "custom offload hooks can only be set at the of the module"
@@ -5919,13 +6048,15 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                 submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode= compile_mode) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
                     #dynamic=True,
 
+        if towers_names:
+            self._shared_tensors_to_base(model_id)
         if towers_names and BASE_SMALL_MODULE_SIZE:
             self._small_modules_to_base(model_id, towers_names)
         if cpu_roots:
             self._split_cpu_compute(model_id, towers_names)
         self.tune_preloading(model_id, current_budget, towers_names)
-        if self.auto_preload_requested and current_budget > 0 and towers_names and self.async_transfers and not compilationInThisOne:
-            auto_models.append(model_id)
+        if self.preload_plans and current_budget > 0 and towers_names and self.async_transfers and not compilationInThisOne:
+            (auto_models if self.auto_preload_requested else fixed_models).append(model_id)
         self.parameters_ref  = {} 
 
 
@@ -5946,9 +6077,9 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
             print(f"Size of submodel '{pre if first < 0 else pre + str(first) + ('' if first == last else f'-{last}')}': {builtins.sum(sizes)/ONE_MB:.1f} MB{count}")
 
 
-    if auto_models: # before pinning, which pins first the blocks that are not preloaded
+    if auto_models or fixed_models: # before pinning, which pins first the blocks that are not preloaded
         from .auto_preload import AutoPreload
-        self.auto_preload = AutoPreload(self, auto_models, verboseLevel, auto_measures)
+        self.auto_preload = AutoPreload(self, auto_models, verboseLevel, auto_measures, fixed_models)
     for model_id, banks in expert_banks.items():
         if not banks:
             continue
@@ -6106,6 +6237,13 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         kwargs["autoPreload"] = True
     if profile_no == profile_type.AutoRAM_AutoVRAM:
         kwargs.update(pinPool=True, cpuCompute="auto")
+        # a text encoder or a VAE runs once or twice per generation: entering the pinned pool would cost as much as staging its blocks
+        # through the ring, and push out the entries of the models that run many passes (a transformer, a language model), which then copy
+        # them again. A model sets _mm_pinned_pool itself to choose (e.g. an autoregressive language model registered as a text encoder),
+        # also at run time
+        for model_id in ("text_encoder", "text_encoder_2", "vae"):
+            if model_id in modules and getattr(modules[model_id], "_mm_pinned_pool", None) is None:
+                modules[model_id]._mm_pinned_pool = False
 
     if verboseLevel>=2:
         info = info  + f"Profile '{profile_type.tostr(profile_no)}' sets the following options:" #CrLf 

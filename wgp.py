@@ -162,7 +162,7 @@ from shared.api import apply_video_length_duration, get_api_output_options, stor
 from shared.utils.side_files import process_side_files
 from shared.utils import workspace_storage
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
-from shared.llm_engines.nanovllm.vllm_support import resolve_lm_decoder_engine
+from shared.llm_engines.lmgp.vllm_support import resolve_lm_features
 from shared.gradio import assistant_chat, field_help, finetune_editor, gallery_files, local_file_picker, model_infos, model_output_filter, model_selector_toolbar, ui_studio
 from shared.gradio.magic_mask import MagicMaskUI, video_mask_area_visible, video_mask_controls_visible, video_mask_dropdown_visible
 from shared import model_dropdowns
@@ -188,7 +188,7 @@ AUTOSAVE_ERROR_FILENAME = "error_queue.zip"
 AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
-WanGP_version = "18.19"
+WanGP_version = "18.20"
 VIDEO_LENGTH_ROUNDING = "ceil"  # how a requested video length is fitted to the model's frame steps: "floor", "ceil" (never shorter than requested) or "nearest"
 set_video_length_rounding(VIDEO_LENGTH_ROUNDING)
 settings_version = 2.81
@@ -201,7 +201,6 @@ CUSTOM_SETTING_DROPDOWN_MAX = 5
 CUSTOM_SETTING_TYPES = {"int", "float", "text", "dropdown"}
 PHASE_2_TILING_VIDEO_PROMPT_FLAG = "~"
 PHASE_2_TILING_GUIDANCE_VALUE = "2~"
-lm_decoder_engine = ""
 int8_kernels = "auto"
 fp8_kernels = "auto"
 theme_text_size = Size("8.1px", "9px", "10.8px", "12.6px", "14.4px", "19.8px", "23.4px", name="wangp_text_90")
@@ -500,10 +499,6 @@ def edit_task_in_queue( state ):
 
     return task_to_edit_index -1, gr.Tabs(selected="media_gen"), gr.update(visible=False), update_queue_data(queue)
 
-def remember_spatial_upsampler_parameters(state, parameter_values):
-    state["spatial_upsampler_parameters"] = dict(parameter_values or {})
-
-
 def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
     def ret():
         return gr.update(), gr.update()
@@ -524,7 +519,6 @@ def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
     
     inputs["state"] =  state
     inputs["model_type"] = model_type
-    inputs["spatial_upsampler_parameters"] = dict(state.get("spatial_upsampler_parameters", {}))
     inputs.pop("lset_name", None)
     if inputs == None:
         gr.Warning("Internal state error: Could not retrieve inputs for the model.")
@@ -2594,6 +2588,7 @@ family_handlers = ["models.wan.wan_handler", "models.wan.ovi_handler", "models.w
 family_handlers.append("models.prism.prism_handler")
 family_handlers.append("models.flux3.flux3_handler")
 family_handlers.append("models.moss_image.moss_image_handler")
+family_handlers.append("models.fibo2.fibo2_handler")
 family_handlers.append("models.TTS.fish_audio.fish_audio_handler")
 family_handlers.append("models.TTS.moss_tts.moss_tts_handler")
 DEFAULT_LORA_ROOT = "loras" #"models.cosmos3.cosmos3_handler",
@@ -2710,7 +2705,6 @@ if not Path(config_load_filename).is_file():
         "transformer_types": [], 
         "transformer_quantization": "int8",
         "text_encoder_quantization" : "int8",
-        "lm_decoder_engine": "",
         "save_path": "outputs",  
         "image_save_path": "outputs",  
         "compile" : "disabled",
@@ -2833,7 +2827,7 @@ def _normalize_output_paths(config):
 
 _normalize_profile_defaults(server_config)
 _normalize_output_paths(server_config)
-lm_decoder_engine = server_config.get("lm_decoder_engine", "")
+server_config.pop("lm_decoder_engine", None)  # no longer a choice: LM decoders use every optimization supported (resolve_lm_features)
 
 from preprocessing.matanyone.utils.model_assets import migrate_matanyone_install
 migration_note = migrate_matanyone_install(server_config)
@@ -3526,7 +3520,8 @@ cuda_graphs.register_key(lambda: (offload.shared_state.get("_attention"), attent
 # CUDA Graph mode: the attention modes and the classes of quantized weights / layers whose kernels were validated in captured graphs
 CUDA_GRAPH_ATTENTION_MODES = {"sdpa", "flash", "sage", "sage2", "radial", "sol"}
 CUDA_GRAPH_WEIGHT_TYPES = {"WeightQBytesTensor", "ScaledFP8WeightTensor", "Int8ConvRotWeightTensor", "GGUFWeightTensor", "GGUFSourceTensor", "BNBNF4WeightTensor", "AsymW4A8Int8WeightTensor",
-                           "NunchakuSVDQWeightTensor", "NunchakuAWQWeightTensor", "NVFP4WeightTensor"}
+                           "NunchakuSVDQWeightTensor", "NunchakuAWQWeightTensor", "NVFP4WeightTensor",
+                           "QEmbedding"}  # Quanto embedding: a lookup in its WeightQBytesTensor (graph replay equal to eager, 2026-10-20)
 cuda_graphs.register_gate(lambda: None if offload.shared_state.get("_attention") in CUDA_GRAPH_ATTENTION_MODES else
                           f"the attention mode '{offload.shared_state.get('_attention')}' is not supported by them (supported: {', '.join(sorted(CUDA_GRAPH_ATTENTION_MODES))})")
 
@@ -4051,8 +4046,9 @@ def preload_mode(output_type):
     return "manual" if int(args.preload) > 0 else server_config[f"{_normalize_output_type(output_type)}_preload_mode"]
 
 def dynamic_preload(profile, output_type):
-    # profiles 1 and 3 always preload dynamically; 0, 2, 4 and 5 when the VRAM Preload mode of the kind of output asks for it
-    return int(profile) in (1, 3) or preload_mode(output_type) == "dynamic"
+    # profiles 1 and 3 always preload dynamically, profile 0 unless its VRAM Preload mode is manual; 2, 4 and 5 when that mode asks for it
+    mode = preload_mode(output_type)
+    return int(profile) in (1, 3) or mode == "dynamic" or int(profile) == 0 and mode == "default"
 
 auto_preload_measures = {} # model type -> (its model definition, the measures of the automatic preload): measured again with a new definition
 
@@ -4066,7 +4062,7 @@ def auto_preload_store(model_type):
 def init_pipe(pipe, kwargs, profile, output_type="video", extension=None):
     if extension is not None and extension.automatic_memory(): # an extension set to Auto: profile 0, with the VRAM preload of the current model's kind of output
         profile, output_type = 0, loaded_output_type
-        if preload_mode(output_type) == "dynamic":
+        if dynamic_preload(profile, output_type):
             kwargs["autoPreload"] = True
     preload =int(args.preload)
     if preload == 0 and preload_mode(output_type) == "manual": # the VRAM preload of this kind of output, also when a generation overrides its memory profile
@@ -4177,7 +4173,7 @@ def ensure_prompt_enhancer_loaded(override_profile=-1, progress=None, send_cmd=N
                         kwargs = {}
                         pipe = {}
                         setup_prompt_enhancer(pipe, kwargs, gen=gen)
-                        mmgp_engine = getattr(pipe.get("prompt_enhancer_llm_model"), "_nanovllm_mmgp_graphs", False)
+                        mmgp_engine = getattr(pipe.get("prompt_enhancer_llm_model"), "_lm_engine_mmgp_graphs", False)
                         # an LLM on MMGP's engine runs with profile 0 whatever the model's profile: as many of its blocks in VRAM as fit beside
                         # its KV cache and activations (dynamic preload), the blocks it streams pinned while it runs, in reserved RAM shared with
                         # the other models (the profile's); with CPU compute, the CPU processes the blocks out of VRAM while decoding when faster
@@ -4304,14 +4300,12 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
 
     check_download_cancelled(gen)
     profile = compute_profile(override_profile, output_type)
-    lm_decoder_engine_obtained = resolve_lm_decoder_engine(lm_decoder_engine, model_def.get("lm_engines", []) )
-    lm_engine_preload = False # profile 0 keeps an LM engine that needs its weights in place: the dynamic preload keeps them in VRAM
-    if lm_decoder_engine_obtained in ("cg", "vllm") and not dynamic_preload(profile, output_type) and not model_def.get("lm_engine_supports_offload", False):
-        if int(profile) == 0:
-            lm_engine_preload = True
-        else:
-            _load_models_info(f"LM Engine '{lm_decoder_engine_obtained}' has no declared support for this model with Memory Profiles 2/4/5. Switching to Legacy LM Engine...")
-            lm_decoder_engine_obtained = "legacy"
+    # an LM decoder uses every optimization the installation supports (CUDA graphs with any memory profile, Triton, FlashAttention 2)
+    lm_features = resolve_lm_features() if model_def.get("lm_decoder") else None
+    if lm_features is not None:
+        print(f"LM decoder: {lm_features.describe()}")
+    # profile 0 with a Manual VRAM preload: an LM decoding token by token still keeps the layers that fit in VRAM (dynamic preload)
+    lm_engine_preload = lm_features is not None and lm_features.graphs and int(profile) == 0 and not dynamic_preload(profile, output_type)
     preview_mode = server_config.get("generation_preview", "rgb")
     preview_name = preview_path = preview_decoder = None
     if preview_mode not in ("rgb", "tiny_vae_frames", "tiny_vae_video"):
@@ -4334,7 +4328,7 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             preview_decoder = load_decoder(preview_name, preview_path)
         wan_model, pipe = model_type_handler.load_model(
                     local_model_file_list, runtime_model_type or model_type, base_model_type, model_def, quantizeTransformer = quantizeTransformer, text_encoder_quantization = text_encoder_qtype,
-                    dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **model_kwargs )
+                    dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_features=lm_features, **model_kwargs )
 
         kwargs = {}
         if "pipe" in pipe:
@@ -4358,9 +4352,10 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         if custom_compile:
             wan_model.custom_compile(backend= "inductor", mode ="default")
         if compilation == "cudagraph":
-            kwargs["cudaGraphs"] = model_def.get("cuda_graphs", False)
-            if not kwargs["cudaGraphs"]:
+            model_graphs, handler_graphs = model_def.get("cuda_graphs", False), kwargs.get("cudaGraphs", False)  # the handler's: an LM's decoding steps
+            if not model_graphs:
                 _load_models_info("CUDA Graphs are not supported for this Model")
+            kwargs["cudaGraphs"] = True if True in (model_graphs, handler_graphs) else list(dict.fromkeys([*(model_graphs or []), *(handler_graphs or [])])) or False
         if compile_modules == False and compilation == "transformer":
             _load_models_info("Pytorch compilation is not supported for this Model")
         # kwargs["pinnedMemory"] = "text_encoder"
@@ -10958,6 +10953,7 @@ def save_inputs(
             remove_background_images_ref,
             temporal_upsampling,
             spatial_upsampling,
+            spatial_upsampler_parameters,
             spatial_upsampler_prompt,
             spatial_upsampler_reference_images,
             spatial_upsampler_param,
@@ -11801,7 +11797,7 @@ def change_guidance_phases(state, guidance_phases, video_prompt_type):
     return gr.update(visible= guidance_phases >=3 and visible_phases >=3 and multiple_submodels) , gr.update(visible=phase_controls_visible), gr.update(visible=phase_controls_visible and switch_threshold_def.visible, label=switch_threshold_def.label), gr.update(visible= guidance_phases >=3 and visible_phases >=3), gr.update(visible= guidance_phases >=2 and visible_phases >=2), gr.update(visible= guidance_phases >=3 and visible_phases >=3), video_prompt_type, gr.update(visible=phase_2_steps_def.visible)
 
 
-memory_profile_choices= [   ("Profile 0, AutoRAM_AutoVRAM: Profile 4 that reserves RAM only for the model running: the parts sent to the GPU at each step reach it at full speed from Reserved RAM, which passes to the next model when you switch. Fast without the RAM to keep every model reserved. Its VRAM Preload can keep part of each model in VRAM", 0),
+memory_profile_choices= [   ("Profile 0, AutoRAM_AutoVRAM: Profile 4 that reserves RAM only for the model running: the parts sent to the GPU at each step reach it at full speed from Reserved RAM, which passes to the next model when you switch. Fast without the RAM to keep every model reserved. By default its VRAM Preload keeps as much of each model in VRAM as fits", 0),
                             ("Profile 1, HighRAM_HighVRAM: Profile 2 with Dynamic Preload. All models kept in Reserved RAM; as many layers as fit stay in VRAM, the rest are streamed", 1),
                             ("Profile 2, HighRAM_LowVRAM: all models kept in Reserved RAM, sent to the GPU part by part. Runs models larger than your VRAM, leaves VRAM for long videos or large images and switches models fast, needs a lot of RAM", 2),
                             ("Profile 3, LowRAM_HighVRAM (Recommended for Audio): Profile 4 with Dynamic Preload. Only the main models kept in Reserved RAM; as many layers as fit stay in VRAM, the rest are streamed", 3),
@@ -12998,7 +12994,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             spatial_upsampling = spatial_ui["value"]
                             spatial_upsampling_method = spatial_ui["method"]
                             spatial_upsampling_ratio = spatial_ui["ratio"]
-                            spatial_upsampler_parameter_state = spatial_ui["parameters"]
+                            spatial_upsampler_parameters = spatial_ui["parameters"]
                             parameter_components = spatial_ui["parameter_components"]
                             def spatial_parameter_component(name, default):
                                 return parameter_components[name] if name in parameter_components else default if update_form else gr.State(default)
@@ -13014,10 +13010,9 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 film_grain_intensity = gr.Slider(0, 1, value=film_grain_intensity, step=0.01, label="Film Grain Intensity (0 = disabled)", show_reset_button= False) 
                                 film_grain_saturation = gr.Slider(0.0, 1, value=film_grain_saturation, step=0.01, label="Film Grain Saturation", show_reset_button= False) 
 
-                            return temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, temporal_upsampling_method, temporal_upsampling_multiplier, spatial_upsampling_method, spatial_upsampling_ratio, spatial_upsampler_parameter_state, spatial_upsampler_prompt, spatial_upsampler_reference_images, spatial_upsampler_param, spatial_upsampler_param2, spatial_upsampler_extra, spatial_upsampler_media_outputs, spatial_upsampler_help_target_id
-                        spatial_parameter_values = {name: ui_get(name) for name in ("spatial_upsampler_prompt", "spatial_upsampler_reference_images", "spatial_upsampler_param", "spatial_upsampler_param2")}
-                        spatial_parameter_values.update(state_dict.get("spatial_upsampler_parameters", {}))
-                        temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, temporal_upsampling_method, temporal_upsampling_multiplier, spatial_upsampling_method, spatial_upsampling_ratio, spatial_upsampler_parameter_state, spatial_upsampler_prompt, spatial_upsampler_reference_images, spatial_upsampler_param, spatial_upsampler_param2, spatial_upsampler_extra, spatial_upsampler_media_outputs, spatial_upsampler_help_target_id = gen_upsampling_dropdowns(ui_get("temporal_upsampling"), ui_get("spatial_upsampling"), ui_get("film_grain_intensity"), ui_get("film_grain_saturation"), image_outputs=image_outputs, spatial_parameter_values=spatial_parameter_values)
+                            return temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, temporal_upsampling_method, temporal_upsampling_multiplier, spatial_upsampling_method, spatial_upsampling_ratio, spatial_upsampler_parameters, spatial_upsampler_prompt, spatial_upsampler_reference_images, spatial_upsampler_param, spatial_upsampler_param2, spatial_upsampler_extra, spatial_upsampler_media_outputs, spatial_upsampler_help_target_id
+                        spatial_parameter_values = {**ui_defaults, **ui_defaults.get("spatial_upsampler_parameters", {})}
+                        temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, temporal_upsampling_method, temporal_upsampling_multiplier, spatial_upsampling_method, spatial_upsampling_ratio, spatial_upsampler_parameters, spatial_upsampler_prompt, spatial_upsampler_reference_images, spatial_upsampler_param, spatial_upsampler_param2, spatial_upsampler_extra, spatial_upsampler_media_outputs, spatial_upsampler_help_target_id = gen_upsampling_dropdowns(ui_get("temporal_upsampling"), ui_get("spatial_upsampling"), ui_get("film_grain_intensity"), ui_get("film_grain_saturation"), image_outputs=image_outputs, spatial_parameter_values=spatial_parameter_values)
 
                 with gr.Tab("Audio", visible = not (image_outputs or audio_only)) as audio_tab:
                     audio_processor_ui = audio_processor_api.create_generation_audio_ui(gr, ui_get, ui_defaults, any_control_video=any_control_video, update_form=update_form)
@@ -13547,7 +13542,6 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             target_settings = gr.Text(value = "settings", interactive= False, visible= False)
             last_choice = gr.Number(value =-1, interactive= False, visible= False)
             PP_spatial_upsampler_help_target = gr.State(PP_spatial_upsampler_help_target_id)
-            spatial_upsampler_parameter_state.change(fn=remember_spatial_upsampler_parameters, inputs=[state, spatial_upsampler_parameter_state], outputs=None, show_progress="hidden")
 
             resolution_group.input(fn=change_resolution_group, inputs=[state, resolution_group, resolution], outputs=[resolution], show_progress="hidden").then(fn=sync_resolution_mp, inputs=[state, resolution], outputs=[resolution_ratio, resolution_mp], show_progress="hidden")
             resolution.input(fn=sync_resolution_mp, inputs=[state, resolution], outputs=[resolution_ratio, resolution_mp], show_progress="hidden")

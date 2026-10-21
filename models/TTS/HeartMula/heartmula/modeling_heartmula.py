@@ -153,8 +153,8 @@ class HeartMuLa(PreTrainedModel):
         self.muq_linear = nn.Linear(config.muq_dim, backbone_dim)
         self.post_init()
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        self._cuda_graph_hooks.set_lm_decoder_engine(lm_decoder_engine)
+    def set_cuda_graphs(self, enabled: bool) -> None:
+        self._cuda_graph_hooks.set_cuda_graphs(enabled)
 
     def prepare_decode_cuda_graph(
         self, *, max_backbone_tokens: int, max_decoder_tokens: int
