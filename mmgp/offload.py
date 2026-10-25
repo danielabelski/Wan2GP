@@ -4745,6 +4745,8 @@ class offload:
 
     # @torch.compiler.disable()
     def gpu_load(self, model_id):
+        from .auto_preload import end_open_cycles
+        end_open_cycles(self, model_id)  # the VRAM this model takes is not the activations of the cycles other models left open
         need, whole = self._pool_need(model_id)
         if whole and self.ring is not None and not self.active_models_ids and not self.ring.jobs and self.ring.size < 2 * self._ring_bound(model_id):
             self._release_ring(on_demand=True) # made for the smaller blocks of another model: made again for this one's if it needs one

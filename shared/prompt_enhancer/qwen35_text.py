@@ -1,12 +1,15 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import ctypes
 import gc
 import json
+import mmap
 import os
 import re
 import sys
 import types
+import weakref
 from collections import OrderedDict
 
 import numpy as np
@@ -132,17 +135,29 @@ def _resolve_gguf_linear_attention_layout_from_filename(model_path: str) -> tupl
 
 
 class _HostMapping:
-    """A pinned CPU tensor seen as CUDA memory: with unified addressing its host address is a device address (zero-copy reads)."""
+    """Page-locked RAM seen as CUDA memory (zero-copy reads), for as long as the CUDA view of it lives: whole pages of a plain buffer registered
+    as mapped (pin_memory would round the allocation up to a power of two), at the device address the driver gives them (not the host one on
+    Windows)."""
 
-    def __init__(self, tensor: torch.Tensor):
-        self.tensor = tensor
-        self.__cuda_array_interface__ = dict(shape=(tensor.numel() * tensor.element_size(),), typestr="|u1", data=(tensor.data_ptr(), False), version=3)
+    def __init__(self, nbytes: int):
+        page = mmap.PAGESIZE
+        self.buffer = buffer = torch.empty(nbytes + 2 * page, dtype=torch.uint8, device="cpu")  # its own pages: registration rounds to pages
+        self.host = buffer[(-buffer.data_ptr()) % page:][:nbytes]
+        cudart = torch.cuda.cudart()
+        if cudart.cudaHostRegister(self.host.data_ptr(), -(-nbytes // page) * page, 2) != cudart.cudaError.success:  # cudaHostRegisterMapped
+            raise RuntimeError("cudaHostRegister failed for the mapped token table.")
+        weakref.finalize(self, lambda ptr, buffer: cudart.cudaHostUnregister(ptr), self.host.data_ptr(), buffer)  # before the buffer is freed
+        driver = ctypes.WinDLL("nvcuda.dll") if os.name == "nt" else ctypes.CDLL("libcuda.so.1")
+        device_ptr = ctypes.c_uint64()
+        if driver.cuMemHostGetDevicePointer_v2(ctypes.byref(device_ptr), ctypes.c_void_p(self.host.data_ptr()), 0) != 0:
+            raise RuntimeError("cuMemHostGetDevicePointer failed for the mapped token table.")
+        self.__cuda_array_interface__ = dict(shape=(nbytes,), typestr="|u1", data=(device_ptr.value, False), version=3)
 
 
 def _host_mapped(tensor: torch.Tensor) -> torch.Tensor:
-    pinned = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
-    pinned.copy_(tensor.as_subclass(torch.Tensor))
-    return torch.as_tensor(_HostMapping(pinned), device=torch.device("cuda", torch.cuda.current_device())).view(tensor.dtype).view(tensor.shape)
+    mapping = _HostMapping(tensor.numel() * tensor.element_size())
+    mapping.host.view(tensor.dtype).view(tensor.shape).copy_(tensor.as_subclass(torch.Tensor))
+    return torch.as_tensor(mapping, device=torch.device("cuda", torch.cuda.current_device())).view(tensor.dtype).view(tensor.shape)
 
 
 def _map_qwen35_token_table(model) -> None:
@@ -1405,7 +1420,7 @@ def load_qwen35_text_prompt_enhancer(
     # MMGP manages the weights: its graphs replay the decoding passes, its dynamic preload keeps in VRAM all the blocks that fit beside the
     # KV cache and the activations (all of them at first: without its VRAM allocator, the budgets of the profile apply)
     model._lm_engine_mmgp_graphs = features["graphs"]
-    if QWEN35_LLM_MAPPED_TOKEN_TABLE and features["cuda"]:
+    if QWEN35_LLM_MAPPED_TOKEN_TABLE and features["cuda"] and torch.version.hip is None:  # CUDA driver mapping (HIP's equivalent not validated)
         _map_qwen35_token_table(model)
     from mmgp import allocator
     if allocator.active == "vmm":
