@@ -152,8 +152,10 @@ def load_pipeline(model_filename, text_encoder_filename, model_def, model_type, 
     encoder.rotary_emb._lock_dtype = torch.float32
     offload.load_model_data(transformer, model_filename, writable_tensors=False, default_dtype=torch.bfloat16, fused_split_map=transformer.split_linear_modules_map)
     offload.load_model_data(encoder, text_encoder_filename, writable_tensors=False, default_dtype=torch.bfloat16, fused_split_map=encoder.split_linear_modules_map)
-    vae_name = 'flux2_small_vae_bf16.safetensors' if model_def.get('moss_edit', False) else 'flux2_small_decoder_bf16.safetensors'
-    offload.load_model_data(vae, fl.locate_file(f'moss_image/{vae_name}'), writable_tensors=False, default_dtype=None)
+    if model_def.get('moss_edit', False):
+        offload.load_model_data(vae.encoder, fl.locate_file('flux2_vae.safetensors'), modelPrefix='encoder', writable_tensors=False, default_dtype=torch.bfloat16)
+    offload.load_model_data(vae, fl.locate_file('moss_image/flux2_small_decoder_bf16.safetensors'), writable_tensors=False, default_dtype=None,
+                            ignore_missing_keys=model_def.get('moss_edit', False))
     transformer.eval()
     encoder.eval()
     vae.eval()

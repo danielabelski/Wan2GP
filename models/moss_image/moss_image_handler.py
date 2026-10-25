@@ -92,9 +92,11 @@ class family_handler:
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
-        vae_name = 'flux2_small_vae_bf16.safetensors' if model_def.get('moss_edit', False) else 'flux2_small_decoder_bf16.safetensors'
-        return [{'repoId': REPO, 'sourceFolderList': [TEXT_FOLDER, 'moss_image'],
-                 'fileList': [['config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'], [vae_name]]}]
+        files = [{'repoId': REPO, 'sourceFolderList': [TEXT_FOLDER, 'moss_image'],
+                  'fileList': [['config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'], ['flux2_small_decoder_bf16.safetensors']]}]
+        if model_def.get('moss_edit', False):
+            files.append({'repoId': 'DeepBeepMeep/Flux2', 'sourceFolderList': [''], 'fileList': [['flux2_vae.safetensors']]})
+        return files
 
     @staticmethod
     def load_model(model_filename, model_type, base_model_type, model_def, text_encoder_filename=None, save_quantized=False, dtype=torch.bfloat16, **kwargs):
