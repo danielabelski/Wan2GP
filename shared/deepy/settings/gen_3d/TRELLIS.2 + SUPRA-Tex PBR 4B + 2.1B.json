@@ -1,7 +1,7 @@
 {
-    "settings_version": 2.81,
-    "model_type": "trellis2",
-    "type": "TRELLIS.2 4B",
+    "settings_version": 2.82,
+    "model_type": "trellis2_shape",
+    "type": "TRELLIS.2 Shape 4B",
     "prompt": "",
     "image_mode": 1,
     "video_prompt_type": "I",
@@ -10,13 +10,14 @@
     "multi_prompts_gen_type": "FG",
     "num_inference_steps": 12,
     "guidance_scale": 7.5,
-    "alt_guidance_scale": 1.0,
     "model_mode": 2,
     "custom_settings": {
-        "texture_mode": "texture",
         "max_faces": 100000,
+        "max_tokens": 49152
+    },
+    "temporal_upsampling": "supratex",
+    "temporal_postprocessing_parameters": {
         "texture_size": 2048,
-        "max_tokens": 49152,
-        "alpha_mode": "opaque"
+        "texture_max_faces": 0
     }
 }

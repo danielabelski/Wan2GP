@@ -26,16 +26,16 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 ### Deepy Prime — From an Idea to a Finished Creation
 
 - **A local creative assistant**: plan and run image, video, speech, music, 3D and world generation, inspect the results, and refine them in chat.
-- **More context in the same VRAM**: the **Q4 KV cache** fits roughly twice the conversation context within the same memory budget.
+- **More context in the same VRAM**: the **Q4 KV cache** fits roughly x4 the conversation context within the same memory budget.
 - **Research and find resources**: optional web search finds facts and visual references; Deepy can also find compatible LoRAs on Hugging Face and Civitai. Web access is off by default; Civitai downloads need your API key.
 - **Create with Python and Media Flow**: make exact lettering, charts, subtitles and procedural 3D props; automate batches and restore, upscale or smooth long videos while preserving their audio.
-- **Deepy Apps — development preview**: ask Deepy to build games, interactive stories, music toys and explorable 3D scenes using generated assets. Play them in WanGP, keep progress, share `.wgpapp` files and continue improving them in later chats. Enable **App Development (Advanced) > Web Apps** with the **Python Sandbox** enabled. See the [Apps guide](docs/APPS.md).
+- **Deepy Apps — development preview**: ask Deepy to build games, interactive stories, music toys and explorable 3D scenes using generated assets. Play them in WanGP, keep progress, share `.wgpapp` files and continue improving them in later chats.  
 
 [Meet Deepy](https://wangp.ai/deepy/) · [Try 10 generated apps](https://wangp.ai/deepy/apps/) · [World Models demos and exploration guide](https://wangp.ai/worlds/)
 
 ### Run More Models on More Hardware
 
-- **Low VRAM requirements**: run select models with as little as **6 GB of VRAM**.
+- **Low VRAM requirements**: run select models with as little as **4 GB of VRAM**.
 - **Older Nvidia GPU support**: use GTX 10XX, RTX 20XX, and newer cards.
 - **AMD GPU support**: run on RDNA 4, 3, 3.5, and 2 hardware; see the Installation section below.
 - **Fast latest-GPU performance**: take advantage of modern GPU acceleration.
@@ -47,6 +47,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 - **Generation queue**: line up videos, images, and audio jobs, then come back later.
 - **Headless mode**: launch batches from the command line for images, videos, and audio.
 - **WanGP API**: add generative capabilities to your own apps.
+- **MCP Interface**: external agents can access to all WanGP features and their activity is  visible in the Web interface.
 
 ### Built-In Creation Tools
 
@@ -55,7 +56,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 - **Per-model prompt enhancer**: improve prompts with model-specific syntax and expectations.
 - **Input preparation tools**: use the mask editor, background remover, pose/depth/flow extractors, speaker diarization, and background noise/song remover.
 - **Offline workflows**: keep generation and Deepy local; use `--offline` to require already-downloaded files and prevent automatic downloads.
-- **Temporal and spatial upsampling**: improve outputs with RIFE, FlashVSR, and Lanczos.
+- **Temporal and spatial upsampling**: improve outputs with DLLS5, RIFE, FlashVSR, SeedVR and Lanczos.
 - **Audio postprocessing**: generate soundtracks with MMAudio, replace voices with SeedVC, or remux a video with any soundtrack.
 - **Ready-to-use plug-ins**: Gallery Browser, Motion Designer, Models/Checkpoints Manager, CivitAI browser and downloader, and more.
 
@@ -81,6 +82,20 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 
 ## 🔥 Latest Updates : 
+
+## 29th of October 2026: WanGP v18.88 - Are You Game?
+
+- **Deepy Prime Can Now Build Apps**: turn an idea into a game, an interactive story, a music toy or an explorable 3D scene, with images, video, sound and 3D assets made by WanGP's generative models. Play in the chat, keep your creations in the new **Apps gallery**, save progress and share them as `.wgpapp` files. Deepy can keep improving an app in later conversations, including one someone else shared with you. This development preview is off by default: under **Configuration → Prompt Enhancer / Deepy → Python**, enable **Python Sandbox** and set **App Development (Advanced)** to **Web Apps**, then save. See the [Apps guide](docs/APPS.md).
+
+- **3D Models, Organized by What You Want to Do**: start with **Create**, **Texture**, **Refine**, **Split**, **Animate** or **Reconstruct**, then choose a model for that task. Shape generation and texturing are now separate choices: use a preset to combine them in one generation, optionally adding new **Hi3D** refinement before also new **SUPRA-Tex**, **Hunyuan3D 2.1 Paint** or **TRELLIS.2 Texture** paints the result. Existing meshes can go straight to the matching tool with **To Input Mesh** in the 3D gallery. See the [3D models guide](docs/MODELS.md#3d-models).
+
+- **H3 Regenerate for High-Resolution Video**: choose the **H3 Regenerate 2K 2 Phases** preset for a first pass at lower resolution followed by a new three-step refinement at the selected output resolution. It enhances fine detail while preserving the first pass's soundtrack. The previous workflow remains available through **H3 Original 2 Phases** and **H3 Vanilla 1 Phase (Reset)** returns to single-pass generation.
+
+- **More Room When RAM Runs Short**: WanGP automatically reclaims memory held by idle models to make room for the model doing the work. On Windows, it also frees cached checkpoint data left behind after loading, reducing RAM pressure when several generation and assistant models share the same PC.
+
+[![Deepy Apps showcase: The Lantern of the Moonwood, Neon Runner, Solar System Mission and Island Flyer](docs/images/deepy-apps-showcase.png)](https://wangp.ai/deepy/apps/)
+
+*Stories, rhythm games and 3D adventures made with Deepy. [Play all 10 demos and download their .wgpapp files](https://wangp.ai/deepy/apps/).*
 
 ## 27th of October 2026: WanGP v18.84 - The One World Generator
 

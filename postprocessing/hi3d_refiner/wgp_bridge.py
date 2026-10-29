@@ -37,7 +37,8 @@ class Hi3DRefinerBridge(SimpleScaleSuffixMixin):
             "postprocessing_category": POSTPROCESSING_CATEGORY_REFINER,
             "progress_label": "Refining Geometry",
             "description": "Adds the fine geometric detail of the object image (tufting, scales, teeth, panel lines) to a coarse mesh, keeping its position, "
-                           "orientation and scale. It replaces the geometry, so the result is untextured: add a Texturer to paint it.",
+                           "orientation and scale. Its detail goes to solid parts: thin sheets such as leaves or fabric keep the coarse surface. It replaces the geometry, "
+                           "so the result is untextured: add a Texturer to paint it.",
             "media_descriptions": {UPSAMPLER_PROFILE_3D: "Hi3D v1.0 refines the mesh in passes up to the chosen level: 1024 suits most objects, 1536 adds a little more "
                                                          "at about three times the time. The mesh and the image must show the same object, facing the same way."},
             "method_parameters": {METHOD: [

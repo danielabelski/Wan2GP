@@ -259,6 +259,38 @@ def _read_document(source) -> dict:
         return _split_glb(head + handle.read(struct.unpack_from("<I", head, 12)[0]))[0]
 
 
+def glb_add_files(data: bytes, files: dict[str, list[bytes]], key: str) -> bytes:
+    """GLB with files (encoded pictures by role, e.g. {"image_refs": [PNG bytes]}) appended to its BIN chunk, one buffer view each, listed
+    in asset.extras[key] as {role: [buffer view index]}. No texture uses them, so viewers ignore them, and the JSON chunk stays small for
+    the readers of the settings. A GLB that already lists files under key is returned unchanged."""
+    gltf, binary, _ = _split_glb(data)
+    extras = gltf.setdefault("asset", {"version": "2.0"}).setdefault("extras", {})
+    if key in extras or not any(files.values()):
+        return bytes(data)
+    payload, views, listed = bytearray(binary or b""), gltf.setdefault("bufferViews", []), {}
+    for role, contents in files.items():
+        for content in contents:
+            payload += bytes(-len(payload) % 4)
+            views.append({"buffer": 0, "byteOffset": len(payload), "byteLength": len(content)})
+            listed.setdefault(role, []).append(len(views) - 1)
+            payload += content
+    payload += bytes(-len(payload) % 4)
+    gltf.setdefault("buffers", [{}])[0]["byteLength"] = len(payload)
+    extras[key] = listed
+    return _pack_glb(gltf, struct.pack("<II", len(payload), CHUNK_BIN) + bytes(payload))
+
+
+def glb_read_files(source, key: str) -> dict[str, list[bytes]]:
+    """The files glb_add_files stored under asset.extras[key] of a GLB (path or bytes): {role: [bytes]}, {} without any."""
+    data = source if isinstance(source, (bytes, bytearray, memoryview)) else Path(source).read_bytes()
+    gltf, binary, _ = _split_glb(data)
+    listed, views = gltf.get("asset", {}).get("extras", {}).get(key), gltf.get("bufferViews", [])
+    if not isinstance(listed, dict) or binary is None:
+        return {}
+    span = lambda view: bytes(binary[view.get("byteOffset", 0):view.get("byteOffset", 0) + view["byteLength"]])
+    return {role: [span(views[index]) for index in indices] for role, indices in listed.items()}
+
+
 def glb_read_extras(source) -> dict:
     """asset.extras of a GLB/.gltf file (path or bytes), {} when absent. Reads only the JSON chunk."""
     extras = _read_document(source).get("asset", {}).get("extras")

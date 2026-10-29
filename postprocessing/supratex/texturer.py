@@ -21,6 +21,10 @@ class SupraTexTexturer(MethodValueMixin):
     def __init__(self, server_config: dict[str, Any] | None = None, files_locator=None):
         self.runtime = ModelRuntime(NAME, MODEL_TYPE)
 
+    @staticmethod
+    def persistent_models() -> bool:
+        return True  # kept between generations like a 3D Refiner: MMGP frees the RAM of an idle model under pressure
+
     @classmethod
     def query_temporal_upsampler_def(cls) -> dict[str, Any]:
         return {
@@ -30,7 +34,7 @@ class SupraTexTexturer(MethodValueMixin):
             "config_key": "supratex",
             "pos": 10,
             "methods": [("SUPRA-Tex", METHOD)],
-            "description": "Completes PBR textures (base colour, metallic, roughness) in 3D from the object image: the visible side keeps the image's colours, "
+            "description": "The most faithful Texturer when the image lines up with the mesh. Completes PBR textures (base colour, metallic, roughness) in 3D from the object image: the visible side keeps the image's colours, "
                            "print and patterns, the hidden side is completed consistently. The mesh and the image must show the same object, facing the same way. "
                            "Its material stage is non-commercial (Qwen Research License).",
             "method_parameters": {METHOD: [
@@ -54,14 +58,16 @@ class SupraTexTexturer(MethodValueMixin):
     def supports_loaded_model(self, temporal_upsampling, context, **_kwargs) -> bool:
         return context.base_model_type == MODEL_TYPE
 
-    def texture(self, mesh, temporal_upsampling, *, loaded_model_context=None, reference_image=None, texture_size=2048, max_faces=0, seed=0,
+    def texture(self, mesh, temporal_upsampling, *, loaded_model_context=None, reference_image=None, texture_size=2048, max_faces=0, seed=0, object_camera=None,
                 abort_callback=None, progress_callback=None, **_kwargs):
+        """object_camera: the camera of a Pixal3D mesh (its GLB's OBJECT_CAMERA), used instead of fitting one to the image's silhouette."""
         image = object_image(reference_image)
         if image is None:
             raise ValueError("SUPRA-Tex needs the Object Image of the mesh")
         model = self.runtime.model(loaded_model_context)
         callback, set_status = pipeline_callbacks(model, abort_callback, progress_callback)
-        return self.runtime.run(model.texture_mesh, mesh, image, int(seed), int(max_faces), int(texture_size), callback=callback, set_progress_status=set_status)
+        return self.runtime.run(model.texture_mesh, mesh, image, int(seed), int(max_faces), int(texture_size), object_camera=object_camera, callback=callback,
+                                set_progress_status=set_status)
 
     def release_vram(self) -> None:
         self.runtime.release()

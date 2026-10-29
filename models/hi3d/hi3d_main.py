@@ -28,6 +28,7 @@ from .conditioner import CLIPVisionModel, clip_pixels, condition_tokens, dino_pi
 from .decoder import SparconvVAE
 from .dit import Sparc3DTransformer, fused_split_map
 from .extract import extract_surface
+from .thin_parts import restore_thin_parts
 from .voxelize import adaptive_voxels
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs", "hi3d.json")
@@ -111,15 +112,16 @@ class model_factory:
     # ---------------------------------------------------------------- conditioning
 
     def _object_image(self, image):
-        """Upstream framing of the object; an image without transparency first goes through rembg u2net."""
+        """Upstream framing of the object; an image without transparency first goes through rembg BiRefNet General."""
         digest = _image_digest(image)
         if self._prepared[0] != digest:
             source = image
             if not (has_alpha(image) and image.convert("RGBA").getextrema()[3][0] < 255):
                 set_phase_status("Removing Background")
                 from rembg import remove
+                from preprocessing.rembg.assets import OBJECT_MODEL
                 from shared.utils.utils import new_rembg_session
-                source = remove(image.convert("RGB"), session=new_rembg_session("u2net"))
+                source = remove(image.convert("RGB"), session=new_rembg_session(OBJECT_MODEL))
             self._prepared = (digest, prepare_image(source))
             check_abort()
         return self._prepared[1]
@@ -202,11 +204,14 @@ class model_factory:
     # ---------------------------------------------------------------- generation
 
     def _refined(self, source, condition, level, max_faces, steps, seed, callback=None, prefix=""):
-        """The refined source mesh, cleaned up (upstream's floater removal), decimated to max_faces (0: the level's default) and with its
-        smooth normals."""
+        """The refined source mesh, cleaned up (upstream's floater removal), with the thin parts of source it lost (perforated or vanished
+        sheets) restored from source, decimated to max_faces (0: the level's default) and with its smooth normals."""
         mesh = self.refine(source, condition, level, steps, seed, callback, prefix)
         set_phase_status("Reducing Mesh")
         mesh = remove_floaters(mesh, min_face_ratio=COMPONENT_FACE_RATIO)
+        mesh, restored = restore_thin_parts(source, mesh)
+        if restored:
+            tqdm.write(f"[Hi3D] {restored} faces of thin parts lost by the refinement were restored from the input mesh")
         mesh = decimate(mesh, max_faces or self.config["ladder"]["faces"][LEVELS.index(level)], parts=2).to(self.device)
         check_abort()
         return mesh.replace(normals=vertex_normals(mesh.vertices, mesh.faces))

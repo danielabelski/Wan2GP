@@ -609,7 +609,7 @@ def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
             if not media_source_exists(video_source):
                 validation_error = "Selected media file is missing"
             elif source_is_mesh:
-                validation_error = mesh_postprocessing.validate_late(spatial_upsampling, temporal_upsampling, parameter_ui.settings_runtime_values(inputs, parameter_ui.SPATIAL), parameter_ui.settings_runtime_values(inputs, parameter_ui.TEMPORAL))
+                validation_error = mesh_postprocessing.validate_late(spatial_upsampling, temporal_upsampling, parameter_ui.settings_runtime_values(inputs, parameter_ui.SPATIAL), parameter_ui.settings_runtime_values(inputs, parameter_ui.TEMPORAL), video_source)
             elif not (source_is_video or source_is_image):
                 validation_error = "Post processing is only available with Videos, Images or 3D Meshes"
             else:
@@ -2101,6 +2101,7 @@ def _extract_model_type(params, state, log_prefix="[load]"):
         params.pop("base_model_type", None)
         return "", None
 
+    convert_retired_model_type(params)
     base_model_type = params.get('base_model_type', None)
     model_type = original_model_type = params.get('model_type', base_model_type)
 
@@ -2701,7 +2702,6 @@ family_handlers.append("models.TTS.fish_audio.fish_audio_handler")
 family_handlers.append("models.TTS.moss_tts.moss_tts_handler")
 family_handlers.append("models.hy_nomas.hy_nomas_handler")
 family_handlers.append("models.evoke.evoke_handler")
-family_handlers.append("models.waypoint.waypoint_handler")
 family_handlers.append("models.hi3d.hi3d_handler")
 family_handlers.append("models.supratex.supratex_handler")
 DEFAULT_LORA_ROOT = "loras" #"models.cosmos3.cosmos3_handler",
@@ -2974,7 +2974,7 @@ model_signatures = {"t2v": "text2video_14B", "t2v_1.3B" : "text2video_1.3B",   "
 
 
 def map_family_handlers(family_handlers):
-    base_types_handlers, families_infos, models_eqv_map, models_comp_map = {}, {"unknown": (100, "Unknown")}, {}, {}
+    base_types_handlers, families_infos, models_eqv_map, models_comp_map, retired_types = {}, {"unknown": (100, "Unknown")}, {}, {}, {}
     for path in family_handlers:
         handler = importlib.import_module(path).family_handler
         handler_source = model_handler_sources.get(path, {})
@@ -2991,7 +2991,9 @@ def map_family_handlers(family_handlers):
         families_infos.update(handler.query_family_infos())
         eq_map, comp_map = handler.query_family_maps()
         models_eqv_map.update(eq_map); models_comp_map.update(comp_map)
-    return base_types_handlers, families_infos, models_eqv_map, models_comp_map
+        if hasattr(handler, "query_retired_model_types"):  # model types merged into others: {old type: its main new type}
+            retired_types.update({old_type: (handler, new_type) for old_type, new_type in handler.query_retired_model_types().items()})
+    return base_types_handlers, families_infos, models_eqv_map, models_comp_map, retired_types
 
 # models_eqv_map: bidirectional compatibility between base model types
 # models_comp_map : mono directional compatibility between base model types {"A" : {"B", "C"} } means B & C model types can accept A  model types (but not the other way). Said otherwise B & C are derived data types
@@ -2999,7 +3001,7 @@ def map_family_handlers(family_handlers):
 model_profile_roots_by_architecture = {}
 model_plugin_ids_by_architecture = {}
 
-model_types_handlers, families_infos,  models_eqv_map, models_comp_map = map_family_handlers(family_handlers)
+model_types_handlers, families_infos,  models_eqv_map, models_comp_map, retired_model_types = map_family_handlers(family_handlers)
 
 def collect_prompt_helper_assets(asset_name):
     chunks = []
@@ -3042,6 +3044,29 @@ def get_model_handler(model_type):
     if model_handler is None:
         raise Exception(f"No model handler found for base model type {base_model_type}")
     return model_handler
+
+def convert_retired_model_type(settings):
+    """Settings of a retired model type (merged into other model types: a 3D model replaced by a stage model and post-processors)
+    converted in place by its family handler. Returns the settings' model type, the new one for converted settings."""
+    model_type = settings.get("model_type", settings.get("base_model_type"))
+    if model_type not in retired_model_types:
+        return model_type
+    handler, _ = retired_model_types[model_type]
+    new_type = handler.convert_retired_settings(model_type, settings)
+    settings["model_type"] = new_type
+    if "base_model_type" in settings:
+        settings["base_model_type"] = get_base_model_type(new_type)
+    return new_type
+
+
+def retired_model_selection(entry):
+    """A model selection entry (model_dropdowns) naming a retired model type, renamed to the type replacing it."""
+    level, key = model_dropdowns.parse_model_selection(entry)
+    if level == 1 or key not in retired_model_types:
+        return entry
+    new_type = retired_model_types[key][1]
+    return new_type if level == 3 else f"{level}:{new_type}"
+
 
 def are_model_types_compatible(imported_model_type, current_model_type):
     imported_base_model_type = get_base_model_type(imported_model_type)
@@ -3573,13 +3598,15 @@ def refresh_model_defs():
 refresh_model_defs()
 
 transformer_types = []
-for model_entry in server_config.get("transformer_types", []):
+for model_entry in dict.fromkeys(map(retired_model_selection, server_config.get("transformer_types", []))):
     model_level, model_key = model_dropdowns.parse_model_selection(model_entry)
     if get_model_def(model_key) is None if model_level == 3 else len(model_dropdowns.expand_model_selection([model_entry], displayed_model_types, get_parent_model_type, get_model_family)) == 0:
         print(f"Model '{model_entry}' is missing. Either install it in the finetune folder or remove this model from key 'transformer_types' in {CONFIG_FILENAME}")
     else:
         transformer_types.append(model_entry)
 transformer_type = server_config.get("last_model_type", None)
+if transformer_type in retired_model_types:
+    transformer_type = retired_model_types[transformer_type][1]
 advanced = server_config.get("last_advanced_choice", False)
 last_resolution = server_config.get("last_resolution_choice", None)
 if args.advanced: advanced = True 
@@ -6355,6 +6382,8 @@ def edit_mesh(send_cmd, state, mesh_source, seed, temporal_upsampling, spatial_u
     configs, _, _ = get_settings_from_file(state, mesh_source, False, False, False)
     configs = dict(configs) if configs is not None else {"type": get_model_record("Post Processing")}
     status = "Post Processing"
+    if not parameter_settings.get(parameter_ui.IMAGES_SETTING):  # no Object Image given: the one embedded in the GLB (Embed Source Images)
+        parameter_settings = {**parameter_settings, parameter_ui.IMAGES_SETTING: mesh_postprocessing.embedded_object_images(mesh_source, extract=True)}
 
     def progress(phase, current_step=None, total_steps=None, unit=None):
         status_msg = merge_status_context(status, str(phase))
@@ -8456,7 +8485,8 @@ def generate_media(
                                                                                         return_tensor= model_def.get("return_image_refs_tensor", False),
                                                                                         ignore_last_refs=ignored_image_refs,
                                                                                         background_removal_color = background_removal_color,
-                                                                                        keep_alpha = model_def.get("image_refs_keep_alpha", False))
+                                                                                        keep_alpha = model_def.get("image_refs_keep_alpha", False),
+                                                                                        rembg_model = model_def.get("background_removal_model", "u2net"))
             custom_postprocessor = model_def.get("custom_image_ref_postprocessor", None)
             if window_no == 1 and repeat_no == 1 and custom_postprocessor is not None:
                 src_ref_images, src_ref_masks = custom_postprocessor(
@@ -9585,7 +9615,7 @@ def validate_task(task, state, skip_validate_settings=False):
             if not media_source_exists(video_source):
                 validation_error = "Selected media file is missing"
             elif source_is_mesh:
-                validation_error = mesh_postprocessing.validate_late(spatial_upsampling, temporal_upsampling, parameter_ui.settings_runtime_values(inputs, parameter_ui.SPATIAL), parameter_ui.settings_runtime_values(inputs, parameter_ui.TEMPORAL))
+                validation_error = mesh_postprocessing.validate_late(spatial_upsampling, temporal_upsampling, parameter_ui.settings_runtime_values(inputs, parameter_ui.SPATIAL), parameter_ui.settings_runtime_values(inputs, parameter_ui.TEMPORAL), video_source)
             elif not (source_is_video or source_is_image):
                 validation_error = "Post processing is only available with Videos, Images or 3D Meshes"
             else:
@@ -10587,7 +10617,7 @@ def apply_post_processing(state, input_file_list, choice, PP_temporal_upsampling
         validation_error = "Selected media file is missing"
     elif is_mesh:
         validation_error = mesh_postprocessing.validate_late(PP_spatial_upsampling, PP_temporal_upsampling, parameter_ui.settings_runtime_values(overrides, parameter_ui.SPATIAL),
-                                                             parameter_ui.settings_runtime_values(overrides, parameter_ui.TEMPORAL))
+                                                             parameter_ui.settings_runtime_values(overrides, parameter_ui.TEMPORAL), media_file)
     elif not (is_video or is_image):
         validation_error = "Post processing is only available with Videos, Images or 3D Meshes"
     else:
@@ -10866,9 +10896,10 @@ def export_settings(state, include_media=False):
 
 
 def extract_and_apply_source_images(file_path, current_settings):
+    from shared.utils.mesh_outputs import extract_mesh_source_images
     from shared.utils.video_metadata import extract_source_images
     if not os.path.isfile(file_path): return 0
-    extracted_files = extract_source_images(file_path)            
+    extracted_files = extract_mesh_source_images(file_path) if has_mesh_file_extension(file_path) else extract_source_images(file_path)
     if not extracted_files: return 0
     applied_count = 0
     for name in image_names_list:
@@ -10926,10 +10957,10 @@ def use_video_settings(state, input_file_list, choice, source):
             elif has_image_file_extension(file_name):
                 set_model_settings(state, model_type, defaults)
                 gr.Info(f"Settings Loaded from Image with prompt '{prompt[:100]}'")
-            elif has_video_file_extension(file_name):
+            elif has_video_file_extension(file_name) or has_mesh_file_extension(file_name):
                 extracted_images = extract_and_apply_source_images(file_name, defaults)
                 set_model_settings(state, model_type, defaults)
-                info_msg = f"Settings Loaded from Video with prompt '{prompt[:100]}'"
+                info_msg = f"Settings Loaded from {'Video' if has_video_file_extension(file_name) else '3D Asset'} with prompt '{prompt[:100]}'"
                 if extracted_images:
                     info_msg += f" + {extracted_images} source {'image' if extracted_images == 1 else 'images'} extracted"
                 gr.Info(info_msg)
@@ -11043,7 +11074,7 @@ def get_settings_from_file(state, file_path, allow_json, merge_with_defaults, sw
             merge_loras = profile_merge_loras
 
     current_model_type = get_state_model_type(state)
-    
+    convert_retired_model_type(configs)
     model_type = configs.get("model_type", None)
     if get_base_model_type(model_type) == None:
         model_type = configs.get("base_model_type", None)
@@ -11153,7 +11184,7 @@ def load_settings_from_file(state, file_path):
     # Extract and apply embedded source images from video files
     extracted_images = 0
     file_path_text = str(getattr(file_path, "name", file_path) or "")
-    if file_path_text.lower().endswith((".mkv", ".mov", ".mp4")):
+    if file_path_text.lower().endswith((".mkv", ".mov", ".mp4", ".glb")):
         extracted_images = extract_and_apply_source_images(file_path_text, configs)
     if settings_bundle_task_count > 1:
         gr.Info(f"Settings bundle contains {settings_bundle_task_count} tasks; only the first task has been extracted.")
@@ -11164,6 +11195,8 @@ def load_settings_from_file(state, file_path):
         if extracted_images > 0:
             info_msg += f" + {extracted_images} source image(s) extracted and applied"
         gr.Info(info_msg)
+    elif has_mesh_file_extension(file_path_text):
+        gr.Info(f"Settings Loaded from 3D Asset with prompt '{prompt[:100]}'" + (f" + {extracted_images} source image(s) extracted and applied" if extracted_images > 0 else ""))
     else:
         gr.Info(f"Settings Loaded from Settings file with prompt '{prompt[:100]}'")
 

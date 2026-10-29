@@ -13,9 +13,10 @@ from mmgp import offload, runtime
 from PIL import Image
 from safetensors.torch import load_file
 
-from shared.mesh3d import Mesh, load_mesh, mesh_to_glb
+from shared.mesh3d import Mesh, glb_read_extras, load_mesh, mesh_to_glb
 from shared.mesh3d.cleanup import BackgroundUnwrap, decimate, merge_vertices
 from shared.mesh3d.render import preview
+from shared.utils.mesh_postprocessing import OBJECT_CAMERA
 from shared.utils import files_locator as fl
 from shared.utils.phase_progress import PhaseProgress, check_abort, generation_progress, set_phase_status
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -28,7 +29,7 @@ from .alignment import Placement, place_mesh
 from .material import RESOLUTION as MATERIAL_RESOLUTION, MaterialEstimator
 
 PROJECT = "supratex"
-TEXTURE_ARCH, SHAPE_ARCH, FULL_ARCH = "supratex_texture", "pixal3d", "supratex"
+TEXTURE_ARCH, SHAPE_ARCH = "supratex_texture", "pixal3d"
 NAF_FILE = "supratex/naf_bf16.safetensors"
 CONFIG_FILE, PARTIAL_FILE = "supratex/completion_config.json", "supratex/completion_partial_normalization.json"
 MATERIAL_LORA_FILE, MATERIAL_EMBEDDINGS_FILE = "supratex/supratex_material_lora_bf16.safetensors", "supratex/supratex_material_embeddings_bf16.safetensors"
@@ -38,7 +39,7 @@ ENCODER_CONFIG = {"model_channels": [64, 128, 256, 512, 1024], "latent_channels"
 DECODER_CONFIG = {"out_channels": 6, "model_channels": [1024, 512, 256, 128, 64], "latent_channels": 32, "num_blocks": [4, 16, 8, 4, 0], "pred_subdiv": False}
 PREVIEW_SIZE = 512
 UNWRAP_REGION_FACES = 40000
-COMPLETION_STEPS = 25  # upstream's fixed texture sampler (the geometry stages use the generation's steps)
+COMPLETION_STEPS = 25  # upstream's texture sampler steps
 
 
 def _keep_checkpoint_dtypes(model):
@@ -74,17 +75,17 @@ def object_square(image):
 
 
 class model_factory:
-    """supratex_texture: textures of a supplied mesh; pixal3d: a pixel-aligned mesh of the object image; supratex: both (modes)."""
+    """supratex_texture: textures of a supplied mesh (also the SUPRA-Tex Texturer); pixal3d: a pixel-aligned mesh of the object image, its
+    GLB carrying the object image's camera (OBJECT_CAMERA) for the texturer."""
 
     def __init__(self, model_filename, model_type, base_model_type, text_encoder_filename=None, save_quantized=False, **kwargs):
         self.device = torch.device("cuda")
-        self.textured, self.geometry = base_model_type != SHAPE_ARCH, base_model_type != TEXTURE_ARCH
+        self.textured, self.geometry = base_model_type == TEXTURE_ARCH, base_model_type == SHAPE_ARCH
         self.qwen = self.pixal3d = None
         if self.textured:
             self._load_texturing(model_filename, model_type, text_encoder_filename, save_quantized, **kwargs)
-        if self.geometry:
-            # pixal3d: its flows are the model file; supratex: the pixal3d module after the two texturing files; MoGe-2 comes last
-            self._load_geometry(model_filename[0] if base_model_type == SHAPE_ARCH else model_filename[2], model_filename[-1], model_type, save_quantized and base_model_type == SHAPE_ARCH)
+        else:  # its flows are the model file, MoGe-2 the module after it
+            self._load_geometry(model_filename[0], model_filename[-1], model_type, save_quantized)
         self.cache = TextEncoderCache()
         self._interrupt = False
 
@@ -144,8 +145,7 @@ class model_factory:
         self.naf = _load_module(naf_model, fl.locate_file(NAF_FILE))
         self.moge = _load_module(moge, moge_filename, fused_split_map=QKV_SPLIT_MAP)
         self.flows = flows
-        if not self.textured:
-            self.transformer = flows["ss_flow"]  # wgp's main model of the pixal3d type (TRELLIS.2 does the same)
+        self.transformer = flows["ss_flow"]  # wgp's main model of the pixal3d type (TRELLIS.2 does the same)
         self.pixal3d = pixal3d.Pixal3DGeometry(flows, self.ss_decoder, self.shape_decoder, self.image_encoder, self.naf, config, self.device)
 
     def pipe(self):
@@ -155,7 +155,7 @@ class model_factory:
                          "texture_decoder": self.texture_decoder, "material_transformer": self.qwen_pipe["transformer"],
                          "text_encoder": self.qwen_pipe["text_encoder"], "vision_encoder": self.qwen_pipe["vision_encoder"], "vae": self.qwen_pipe["vae"]})
         if self.geometry:
-            flows = {"transformer" if not self.textured else "ss_flow": self.flows["ss_flow"], "shape_flow": self.flows["shape_lowres"], "shape_flow2": self.flows["shape_highres"]}
+            flows = {"transformer": self.flows["ss_flow"], "shape_flow": self.flows["shape_lowres"], "shape_flow2": self.flows["shape_highres"]}
             pipe.update(flows, ss_decoder=self.ss_decoder, shape_decoder=self.shape_decoder, image_encoder=self.image_encoder, naf=self.naf, moge=self.moge)
         return pipe
 
@@ -257,10 +257,10 @@ class model_factory:
 
     @generation_progress
     @torch.inference_mode()
-    def texture_mesh(self, mesh, image, seed=0, max_faces=0, texture_size=2048, steps=25, callback=None, set_progress_status=None):
+    def texture_mesh(self, mesh, image, seed=0, max_faces=0, texture_size=2048, steps=COMPLETION_STEPS, object_camera=None, callback=None, set_progress_status=None):
         """The Texturer entry (post-processing): PBR textures of mesh (shared.mesh3d Mesh) completed from the object image (PIL); max_faces
-        0 keeps the mesh's faces."""
-        return self._texture(mesh, image, int(seed), int(max_faces), int(texture_size), int(steps), callback)
+        0 keeps the mesh's faces. object_camera: the camera of a Pixal3D mesh (its GLB's OBJECT_CAMERA), used instead of a fitted one."""
+        return self._texture(mesh, image, int(seed), int(max_faces), int(texture_size), int(steps), callback, placement=_camera_placement(object_camera, self.device))
 
     @torch.inference_mode()
     def _geometry(self, square, seed, steps, guidance, max_faces, callback):
@@ -299,30 +299,40 @@ class model_factory:
 
     @generation_progress
     @torch.inference_mode()
-    def generate(self, input_prompt, seed, sampling_steps=25, guide_scale=7.5, batch_size=1, model_mode=None, original_input_ref_images=None, input_custom=None,
+    def generate(self, input_prompt, seed, sampling_steps=25, guide_scale=7.5, batch_size=1, original_input_ref_images=None, input_custom=None,
                  custom_settings=None, callback=None, set_progress_status=None, **kwargs):
+        """supratex_texture: textures of the Input Mesh (input_custom); pixal3d: meshes of the object image, each GLB with its camera."""
         settings = custom_settings or {}
-        mode = "texture" if not self.geometry else "shape" if not self.textured else model_mode
         max_faces, texture_size = int(settings.get("max_faces", 0)), int(settings.get("texture_size", 2048))
         image = original_input_ref_images[0]
-        if mode == "texture":
+        cameras = []
+        if self.textured:
             set_phase_status("Loading Mesh")
             source = load_mesh(input_custom)
-            steps = sampling_steps if not self.geometry else COMPLETION_STEPS  # the full model's steps are the geometry's
-            meshes = [self._texture(source, image, seed + i, max_faces, texture_size, steps, callback) for i in range(batch_size)]
+            camera = glb_read_extras(input_custom).get(OBJECT_CAMERA) if str(input_custom).lower().endswith(".glb") else None  # a Pixal3D mesh
+            placement = _camera_placement(camera, self.device)
+            meshes = [self._texture(source, image, seed + i, max_faces, texture_size, sampling_steps, callback, placement=placement) for i in range(batch_size)]
         else:
             set_phase_status("Preparing Object Image")
             square = object_square(image)
             meshes = []
             for i in range(batch_size):
                 mesh, placement = self._geometry(square, seed + i, sampling_steps, guide_scale, max_faces, callback)
-                if mode == "shape_texture":
-                    mesh = self._texture(mesh, image, seed + i, 0, texture_size, COMPLETION_STEPS, callback, placement=placement)
                 meshes.append(mesh)
+                cameras.append({OBJECT_CAMERA: {"camera_angle_x": placement.camera_angle_x, "distance": placement.distance}})
         set_phase_status("Exporting Mesh")
         previews, glbs = [], []
-        for mesh in meshes:
+        for i, mesh in enumerate(meshes):
             previews.append(preview(mesh.to(self.device), PREVIEW_SIZE).cpu())
-            glbs.append(mesh_to_glb(mesh))
+            glbs.append(mesh_to_glb(mesh, extras=cameras[i] if cameras else None))
             check_abort()
         return {"x": torch.stack(previews, dim=1), "meshes": glbs}
+
+
+def _camera_placement(object_camera, device):
+    """Placement of a Pixal3D mesh (in the canonical frame, seen with the object image's camera) from its GLB's OBJECT_CAMERA; None
+    without one (the texturer then fits the placement to the image's silhouette)."""
+    if not object_camera:
+        return None
+    identity, zeros = torch.eye(3, device=device), torch.zeros(3, device=device)
+    return Placement(identity, zeros, 1.0, zeros.clone(), float(object_camera["camera_angle_x"]), float(object_camera["distance"]), float("nan"))

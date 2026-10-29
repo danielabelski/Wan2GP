@@ -1,7 +1,8 @@
 # Placement of an existing mesh in SUPRA-Tex's canonical frame (the [-0.5, 0.5]^3 cube, Y up, a perspective camera on +Z looking at
 # the origin whose image spans the cube's width at the origin): rotation, scale and offset matching the mesh silhouette to the object
 # image's alpha. Upstream receives this placement from its own geometry stage (Pixal3D generates the mesh in the camera frame); meshes of
-# other models or files are fitted here. WanGP meshes face +Z with Y up, so the search stays near the identity rotation.
+# other models or files are fitted here. WanGP meshes face +Z with Y up: the search covers the front half, seen from level to nearly
+# straight down (product photos are often taken from above), then the other half when it fits clearly better.
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import math
 from dataclasses import dataclass
@@ -16,7 +17,13 @@ SIZE = 192  # silhouette resolution of the search
 CUBE_HALF = 0.49  # the placed mesh stays inside the canonical cube
 FOVS = (30.0, 37.5, 45.0, 52.5)  # horizontal fields of view tried (degrees)
 ROTATION_MARGIN = 0.03  # IoU a mesh facing another axis must gain over the front placements
-FRONT_YAWS = (-60.0, -45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0, 60.0)
+FRONT_YAWS = tuple(float(yaw) for yaw in range(-90, 91, 15))
+BACK_YAWS = (120.0, 150.0, 180.0, 210.0, 240.0)
+PITCHES = (0.0, 15.0, 30.0, 45.0, 60.0, 75.0)  # the camera's elevation above the object
+SEARCH_FACES = 20000  # faces of the decimated copy the silhouettes are rasterized from
+FIT_STEPS = ((0.04, 2), (0.02, 1), (0.01, 0.5))  # (scale factor, offset in pixels) of the pattern search
+REFINE_STEPS = ((0.02, 1), (0.01, 0.5))
+CANDIDATES = 4  # coarse placements given a full fit
 
 
 @dataclass
@@ -81,9 +88,9 @@ def _search(points, faces, target, distance, focal, scale, offset, steps):
     return best, scale, offset
 
 
-def _fit(points, faces, target, distance, focal):
+def _fit(points, faces, target, distance, focal, steps=FIT_STEPS):
     """Scale and image-plane offset of the points (centered) matching the target silhouette: bounding box matching, then a
-    pattern search on the IoU. Returns (iou, scale, offset)."""
+    pattern search on the IoU (none without steps). Returns (iou, scale, offset)."""
     goal = _box(target)
     extent = (points[:, :2].abs().amax() * 2).item()
     scale = (goal[3] - goal[1] if goal[3] - goal[1] > goal[2] - goal[0] else goal[2] - goal[0]) / SIZE * distance / (2 * focal * max(extent, 1e-6)) * 2
@@ -97,12 +104,13 @@ def _fit(points, faces, target, distance, focal):
         shift_u = ((goal[0] + goal[2]) - (box[0] + box[2])) / 2 / SIZE
         shift_v = ((goal[1] + goal[3]) - (box[1] + box[3])) / 2 / SIZE
         offset = offset + torch.tensor([shift_u * distance / focal, -shift_v * distance / focal, 0.0], device=points.device)
-    return _search(points, faces, target, distance, focal, scale, offset, ((0.04, 2), (0.02, 1), (0.01, 0.5)))
+    return _search(points, faces, target, distance, focal, scale, offset, steps)
 
 
-def place_mesh(vertices, faces, alpha, *, max_faces=60000):
+def place_mesh(vertices, faces, alpha, *, max_faces=SEARCH_FACES):
     """Placement of a mesh (vertices (V, 3), faces (F, 3) on the GPU) in the canonical frame matching alpha (H, W) uint8, the object
-    image's alpha on its square canvas. The search runs on a decimated copy of the mesh."""
+    image's alpha on its square canvas. The search runs on a decimated copy of the mesh: a coarse grid of views fitted by their bounding
+    box, full fits of the best ones, then yaw and pitch refined by halving steps and the field of view."""
     device = vertices.device
     if faces.shape[0] > max_faces:
         from shared.mesh3d import Mesh
@@ -115,26 +123,36 @@ def place_mesh(vertices, faces, alpha, *, max_faces=60000):
     center = (low + high) / 2
     centered = vertices.float() - center
 
-    def evaluate(yaw, pitch, fov):
+    def evaluate(yaw, pitch, fov, steps=FIT_STEPS, start=None):
         focal = 0.5 / math.tan(math.radians(fov) / 2)
         distance = 0.5 / math.tan(math.radians(fov) / 2)
         rotation = _rotation(yaw, pitch, device)
         points = centered @ rotation.T
-        iou, scale, offset = _fit(points, faces, target, distance, focal)
+        if start is None:
+            iou, scale, offset = _fit(points, faces, target, distance, focal, steps)
+        else:  # a neighbouring view: its scale and offset start from the current best
+            iou, scale, offset = _search(points, faces, target, distance, focal, *start, steps)
         return iou, (yaw, pitch, fov, rotation, scale, offset, distance)
 
     fov = FOVS[1]
-    # the picture may show the front from three quarters and from above: yaws within 60 degrees of the front, two elevations
-    best = max((evaluate(yaw, pitch, fov) for yaw in FRONT_YAWS for pitch in (0.0, 20.0)), key=lambda candidate: candidate[0])
-    for yaw in (90.0, 180.0, 270.0):  # a mesh facing another axis (front and back silhouettes are mirrors: the front is preferred)
-        candidate = evaluate(yaw, 0.0, fov)
+    coarse = sorted(((evaluate(yaw, pitch, fov, steps=()), yaw, pitch) for yaw in FRONT_YAWS for pitch in PITCHES), key=lambda one: one[0][0], reverse=True)
+    best = max((evaluate(yaw, pitch, fov) for _, yaw, pitch in coarse[:CANDIDATES]), key=lambda candidate: candidate[0])
+    # a mesh facing another axis (front and back silhouettes are mirrors: the front is preferred)
+    back = max(((evaluate(yaw, pitch, fov, steps=()), yaw, pitch) for yaw in BACK_YAWS for pitch in PITCHES[:3]), key=lambda one: one[0][0])
+    if back[0][0] > coarse[0][0][0] + ROTATION_MARGIN:
+        candidate = evaluate(back[1], back[2], fov)
         if candidate[0] > best[0] + ROTATION_MARGIN:
             best = candidate
-    for yaw_step, pitch_step in ((7.5, 10.0), (3.75, 5.0)):
-        for delta in ((-yaw_step, 0.0), (yaw_step, 0.0), (0.0, -pitch_step), (0.0, pitch_step)):
-            candidate = evaluate(best[1][0] + delta[0], best[1][1] + delta[1], fov)
-            if candidate[0] > best[0]:
-                best = candidate
+    for step in (7.5, 3.75, 1.875):
+        improved = True
+        while improved:
+            improved = False
+            for delta in ((-step, 0.0), (step, 0.0), (0.0, -step), (0.0, step)):
+                yaw, pitch = best[1][0] + delta[0], min(max(best[1][1] + delta[1], -30.0), 89.0)
+                candidate = evaluate(yaw, pitch, fov, REFINE_STEPS, start=best[1][4:6])
+                if candidate[0] > best[0] + 1e-4:
+                    best, improved = candidate, True
+            check_abort()
     yaw, pitch = best[1][:2]
     for fov in FOVS:
         if fov != best[1][2]:

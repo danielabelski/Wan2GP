@@ -2,7 +2,7 @@
     "model": {
         "name": "Pixal3D Shape 3x1.3B",
         "architecture": "pixal3d",
-        "description": "Pixal3D turns one picture of an object into a detailed 3D mesh (GLB, geometry only) built in the picture's own camera, so that its visible side matches the image pixel for pixel. It is the geometry of SUPRA-Tex and a good base for texturing from the same picture; about a minute on a fast GPU.",
+        "description": "Pixal3D turns one picture of an object into a detailed 3D mesh (GLB, geometry only) built in the picture's own camera, so that its visible side matches the image pixel for pixel. Its presets add SUPRA-Tex PBR textures (the former SUPRA-Tex model), after the Hi3D 3D Refiner or not; about a minute on a fast GPU for the shape.",
         "URLs": [
             "https://huggingface.co/DeepBeepMeep/3D/resolve/main/pixal3d_shape_bf16.safetensors",
             "https://huggingface.co/DeepBeepMeep/3D/resolve/main/pixal3d_shape_int8_convrot.safetensors"

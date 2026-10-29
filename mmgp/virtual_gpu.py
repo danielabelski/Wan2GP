@@ -5,6 +5,7 @@ would on it (memory profiles, budgets, preloads, CPU compute, the application's 
 
     MMGP_VIRTUAL_VRAM_GB=8 python app.py                    # read when mmgp is first imported (also MMGP_VIRTUAL_VRAM_LIMIT_GB, MMGP_VIRTUAL_RAM_GB)
     from mmgp import virtual_gpu; virtual_gpu.install(8)    # or in code, before the application reads any VRAM figure
+    from mmgp import virtual_gpu; virtual_gpu.install_ram(24) # a RAM budget alone, before mmgp.offload is imported
 
 Emulated:
 - torch.cuda.get_device_properties(...).total_memory;
@@ -14,8 +15,9 @@ Emulated:
 - the free VRAM (torch.cuda.mem_get_info, pynvml.nvmlDeviceGetMemoryInfo): that limit less what the process reserves, but never more than the
   real GPU has free. The VRAM of the other programs on the GPU counts only when it leaves less than the emulated card would (the VRAM
   allocator's room follows the same rule);
-- optionally the RAM: psutil.virtual_memory().total, as MMGP reads it at import (the available RAM stays the machine's: hold the rest with
-  another process to emulate it too).
+- optionally a RAM budget for the process (install_ram): psutil.virtual_memory() reports it as the total RAM, as MMGP reads it at import,
+  and as available what the process leaves of it, so that MMGP plans its reserved RAM, pinned pool and page drops within it. Nothing is
+  held back (mmgp.ram_stress simulates a PC with less RAM under real pressure).
 The GPU's speed, the PCIe bandwidth and the CPU stay the machine's."""
 import os
 import types
@@ -24,6 +26,7 @@ import torch
 
 LIMIT_OVERHEAD_GB = 1.2
 state = {}  # total, limit (bytes) once installed
+ram_state = {}  # total (the budget) and machine (the RAM of the machine) in bytes, once installed
 _real_properties = None  # the real torch.cuda.get_device_properties
 
 
@@ -87,16 +90,31 @@ def install(vram_gb, limit_gb=None, ram_gb=None):
             return types.SimpleNamespace(total=total, used=total - available, free=available, reserved=getattr(info, "reserved", 0))
         pynvml.nvmlDeviceGetMemoryInfo = nvml_memory
 
-    if ram_gb is not None:
-        import psutil
-        real_virtual_memory, ram_total = psutil.virtual_memory, int(float(ram_gb) * 2**30)
-        psutil.virtual_memory = lambda: real_virtual_memory()._replace(total=ram_total)
-
     from . import allocator
     if allocator.active == "vmm":
         allocator.set_vram_limit(limit)
-    print(f"[MMGP] Virtual GPU: {float(vram_gb):g} GB card emulated, the VRAM allocator reserving at most {limit / 2**30:.2f} GiB"
-          + (f", {float(ram_gb):g} GB of RAM" if ram_gb is not None else ""), flush=True)
+    print(f"[MMGP] Virtual GPU: {float(vram_gb):g} GB card emulated, the VRAM allocator reserving at most {limit / 2**30:.2f} GiB", flush=True)
+    if ram_gb is not None:
+        install_ram(ram_gb)
+
+
+def install_ram(ram_gb):
+    """A RAM budget of ram_gb (GiB) for the process, before mmgp.offload reads the RAM at import: psutil.virtual_memory() reports it as the
+    total RAM and as available what the process leaves of it (its working set: the RAM of its own and the checkpoint pages it reads), never
+    more than the system really has available: the other programs' RAM counts only when they leave less. The machine's own RAM stays in
+    ram_state["machine"]: the share of it MMGP may reserve is a safeguard for the system, whatever the budget."""
+    if ram_state:
+        raise RuntimeError("The RAM budget is already installed.")
+    import psutil
+    real_virtual_memory, total, process = psutil.virtual_memory, int(float(ram_gb) * 2**30), psutil.Process()
+    ram_state.update(total=total, machine=real_virtual_memory().total)
+
+    def virtual_memory():
+        real = real_virtual_memory()
+        available = max(0, min(real.available, total - process.memory_info().rss))
+        return real._replace(total=total, available=available, used=total - available, free=min(real.free, available), percent=round(100 * (total - available) / total, 1))
+    psutil.virtual_memory = virtual_memory
+    print(f"[MMGP] RAM budget: {float(ram_gb):g} GB, {virtual_memory().available / 2**30:.1f} GiB of it available", flush=True)
 
 
 def limit_torch_allocator():
@@ -105,6 +123,8 @@ def limit_torch_allocator():
 
 
 def install_from_environment():
-    vram_gb = os.environ.get("MMGP_VIRTUAL_VRAM_GB")
+    ram_gb, vram_gb = os.environ.get("MMGP_VIRTUAL_RAM_GB"), os.environ.get("MMGP_VIRTUAL_VRAM_GB")
+    if ram_gb and not ram_state:
+        install_ram(ram_gb)
     if vram_gb and not state:
-        install(vram_gb, os.environ.get("MMGP_VIRTUAL_VRAM_LIMIT_GB") or None, os.environ.get("MMGP_VIRTUAL_RAM_GB") or None)
+        install(vram_gb, os.environ.get("MMGP_VIRTUAL_VRAM_LIMIT_GB") or None)

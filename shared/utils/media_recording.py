@@ -51,7 +51,7 @@ def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bo
                     save_app_metadata(path, saved_configs)
                 elif source is MESH:
                     from shared.utils.mesh_outputs import save_mesh_metadata
-                    save_mesh_metadata(path, saved_configs)
+                    save_mesh_metadata(path, saved_configs, embedded_images)
                 elif is_image:
                     save_image_metadata(path, saved_configs)
                 else:

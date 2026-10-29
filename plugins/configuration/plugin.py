@@ -877,7 +877,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         self.embed_source_images_choice = gr.Checkbox(
                             value=self.server_config.get("embed_source_images", False),
                             label="Embed Source Images",
-                            info="Saves i2v source images inside MP4/MOV/MKV files"
+                            info="Saves the source images inside MP4/MOV/MKV videos and GLB 3D assets (their object image, reused by late 3D post-processing)"
                         )
                     self.keep_intermediate_sliding_windows_choice = gr.Dropdown(
                         choices=[("Yes", 1), ("No", 0)],

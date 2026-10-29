@@ -1,4 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
+
 from .prompts import (DA3_DEEPY_INFOS, DA3_INFOS, DEEPY_PROMPT_INFOS, MAPANYTHING_DEEPY_INFOS, MAPANYTHING_INFOS, MOGE2_DEEPY_INFOS, MOGE2_INFOS,
                       PROMPT_INFOS)
 from .settings import CUSTOM_SETTINGS, MOGE2_MODES
@@ -30,7 +32,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"recon3d": (3030, "3D Reconstruction")}
+        return goals_3d.family_infos(goals_3d.RECONSTRUCTION)
 
     @staticmethod
     def get_lora_dir(base_model_type):

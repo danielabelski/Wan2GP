@@ -1,7 +1,7 @@
 {
-    "settings_version": 2.81,
-    "model_type": "supratex",
-    "type": "SUPRA-Tex Pixal3D PBR 3x1.3B + 2.1B",
+    "settings_version": 2.82,
+    "model_type": "pixal3d",
+    "type": "Pixal3D Shape 3x1.3B",
     "prompt": "",
     "image_mode": 1,
     "video_prompt_type": "I",
@@ -9,9 +9,12 @@
     "multi_prompts_gen_type": "FG",
     "num_inference_steps": 12,
     "guidance_scale": 7.5,
-    "model_mode": "shape_texture",
     "custom_settings": {
-        "max_faces": 500000,
-        "texture_size": 2048
+        "max_faces": 500000
+    },
+    "temporal_upsampling": "supratex",
+    "temporal_postprocessing_parameters": {
+        "texture_size": 2048,
+        "texture_max_faces": 0
     }
 }

@@ -62,10 +62,12 @@ temporal_upsampler_handlers = [
     "postprocessing.dlss5.temporal_upsampler.DLSSGTemporalUpsampler",
     "postprocessing.hunyuan3d_paint.texturer.Hunyuan3DPaintTexturer",
     "postprocessing.supratex.texturer.SupraTexTexturer",
+    "postprocessing.trellis2_texture.texturer.Trellis2Texturer",
 ]
 _temporal_upsampler_handlers: list[Any] = []
 _temporal_upsampler_server_config: dict[str, Any] | None = None
 _registered_temporal_upsampler_handler_paths: set[str] = set()
+_kept_texturer: Any = None  # the texturer whose models stay loaded: one at a time, as the spatial slot keeps one processor
 
 
 @dataclass
@@ -493,6 +495,7 @@ def texture_mesh(temporal_upsampling, mesh, *, main_offloadobj=None, loaded_mode
     """The mesh (shared.mesh3d.Mesh) textured by the texturer of temporal_upsampling, with its declared parameters from
     parameter_values (the slot's runtime values, parameter_ui.runtime_values) and kwargs (reference_image, seed,
     abort_callback, progress_callback...)."""
+    global _kept_texturer
     handler = find_temporal_upsampler(temporal_upsampling)
     if handler is None:
         raise ValueError(f"No texturer registered for '{temporal_upsampling}'")
@@ -502,6 +505,10 @@ def texture_mesh(temporal_upsampling, mesh, *, main_offloadobj=None, loaded_mode
     kwargs.update(runtime_parameter_kwargs(temporal_upsampling, parameter_values))
     name = handler.query_temporal_upsampler_def()["name"]
     persistent = handler.persistent_models() if hasattr(handler, "persistent_models") else False
+    if persistent:
+        if _kept_texturer not in (None, handler):
+            offload_registry.release_all([_kept_texturer.query_temporal_upsampler_def()["name"]])
+        _kept_texturer = handler
     borrowed_context = compatible_loaded_model(handler, temporal_upsampling, loaded_model_context)
     if borrowed_context is None and hasattr(handler, "download"):
         from shared.utils.download import process_files_def

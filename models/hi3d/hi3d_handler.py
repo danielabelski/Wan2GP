@@ -1,4 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
+from preprocessing.rembg.assets import OBJECT_MODEL
+
 from .prompts import HI3D_DEEPY_INFOS, HI3D_DEEPY_PROMPT_INFOS, HI3D_INFOS, HI3D_PROMPT_INFOS
 
 ARCHITECTURE = "hi3d"
@@ -28,7 +31,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"hi3d": (3040, "Hi3D")}
+        return {"hi3d": (3040, "Hi3D"), **goals_3d.family_infos(goals_3d.REFINE_MESH)}
 
     @staticmethod
     def get_lora_dir(base_model_type):
@@ -37,6 +40,7 @@ class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
         return {
+            "group": goals_3d.REFINE_MESH,
             "image_outputs": True,
             "mesh_outputs": True,
             "device_explicit": True,
@@ -45,6 +49,7 @@ class family_handler:
             "one_image_ref_needed": True,
             "one_image_ref_only": True,
             "image_refs_keep_alpha": True,
+            "background_removal_model": OBJECT_MODEL,  # BiRefNet: no cast shadows in the object cutout
             "fit_into_canvas_image_refs": 0,
             "prompt_description": "Asset Name / Description (optional, used for file names)",
             "prompt_optional": True,  # the prompt only names the output files

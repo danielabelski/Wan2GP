@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from postprocessing import parameter_ui
 from shared.mesh3d.glb import MESH_EXTENSIONS
 from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.gallery_media import disambiguate_gallery_media_ids, gallery_media_ids
@@ -113,8 +114,9 @@ _MCP_MEDIA_SETTING_KEYS = {
     "image_start", "image_end", "image_refs", "image_guide", "image_mask",
     "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source",
     "audio_guide", "audio_guide2", "audio_guide3", "audio_source",
-    "replace_voice_sample", "replace_voice_sample2", "custom_guide",
+    "replace_voice_sample", "replace_voice_sample2", "custom_guide", parameter_ui.IMAGES_SETTING,
 }
+NESTED_SETTINGS = {"custom_settings", *parameter_ui.SETTINGS.values()}  # the settings holding dictionaries
 _GALLERY_LOCK = threading.RLock()
 
 
@@ -882,6 +884,10 @@ def _validate_generation_media(session, settings, model_type, path):
             from postprocessing.audio_processors import method_metadata
             if image_output or not method_metadata(effective.get(method_key, ""))[capability]:
                 reject(key, f"input requires a {method_key} processor that uses it")
+    if parameter_ui.IMAGES_SETTING in supplied:  # read by the post-processors declaring an images parameter (a 3D refiner's or texturer's Object Image)
+        methods = {slot: parameter_ui.method_of(slot, effective.get("spatial_upsampling" if slot == parameter_ui.SPATIAL else "temporal_upsampling", "")) for slot in parameter_ui.SETTINGS}
+        if parameter_ui.images_parameter(*(parameter_ui.slot_parameters(slot, method) for slot, method in methods.items())) is None:
+            reject(parameter_ui.IMAGES_SETTING, "input requires a spatial or temporal post-processor that uses reference images")
 
 
 def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, Any]], allow_read_file_system: bool, file_access_policy=None):
@@ -2097,9 +2103,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(settings, dict):
                     raise ValueError(f"{path} must be a settings object. Nothing was submitted.")
                 defaults_call = f' See wangp_model(model_type="{settings.get("model_type") or "<model_type>"}", action="defaults", arguments={{}}) for setting names and value formats.'
-                nested = [key for key, value in settings.items() if isinstance(value, dict) and key != "custom_settings" or key == "resolution" and not isinstance(value, str)]
+                # nested values: the model's custom_settings and the post-processing slots' parameter dictionaries
+                nested = [key for key, value in settings.items() if isinstance(value, dict) and key not in NESTED_SETTINGS or key == "resolution" and not isinstance(value, str)]
                 if nested:
-                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value, not an object; only custom_settings holds nested values"
+                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value; only custom_settings and *_postprocessing_parameters hold objects"
                     raise ValueError(f"{path}.{nested[0]} {expected}.{defaults_call} Nothing was submitted.")
                 if str(settings.get("mode", "") or "").startswith("edit_"):
                     continue
@@ -2108,6 +2115,8 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(model_type, str) or not model_type.strip():
                     template_hint = "" if api_version == "1" else ', or the settings must name a template ("template": "<task>")'
                     raise ValueError(f"{path}.{model_key} must be a non-empty string for generation{template_hint}. Nothing was submitted.")
+                if session.get_model_metadata(model_type.strip()) is None:  # a retired model type becomes its new type (settings converted in place)
+                    model_type = session._ensure_runtime().module.convert_retired_model_type(settings)
                 if session.get_model_metadata(model_type.strip()) is None:
                     template_call = 'wangp_templates(task="...", template="default")' if api_version == "2.1" else 'wangp_deepy_templates(tool_id="...")'
                     known = [str(item.get("model_type") or "") for item in session.list_model_defs()]

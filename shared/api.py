@@ -1312,6 +1312,7 @@ class WanGPSession:
             runtime_settings_version = getattr(runtime.module, "settings_version", None)
             if runtime_settings_version is not None:
                 settings.setdefault("settings_version", runtime_settings_version)
+            runtime.module.convert_retired_model_type(settings)  # a model type merged into others (3D stage models + post-processors)
             model_type = str(settings.get("model_type", "") or "").strip()
             model_def = runtime.module.get_model_def(model_type) if model_type else None
             if isinstance(model_def, dict):

@@ -39,6 +39,11 @@ def validate_processors(spatial_upsampling, temporal_upsampling) -> str:
             or temporal_upsampler_api.validate_temporal_upsampling(temporal_upsampling, media_kind=MEDIA_3D))
 
 
+# asset.extras key of a mesh generated in the frame of its object image (Pixal3D): that image's camera ({"camera_angle_x", "distance"}),
+# which a texturer projecting the image (SUPRA-Tex) uses instead of fitting one; a refiner keeps the mesh's frame, so it stays valid
+OBJECT_CAMERA = "wangp_object_camera"
+
+
 def validate(model_def, inputs, spatial_upsampling, temporal_upsampling) -> str:
     """Error text for the 3D post-processing of a generation with these inputs, "" when it is valid."""
     if not selected(spatial_upsampling, temporal_upsampling):
@@ -72,11 +77,22 @@ def process_mesh(mesh, spatial_upsampling, temporal_upsampling, *, spatial_value
 
 
 def process_glb(data: bytes, spatial_upsampling, temporal_upsampling, **kwargs) -> tuple[bytes, torch.Tensor]:
-    """A GLB (bytes) through process_mesh: the processed GLB, keeping the source's extras, and its [C, H, W] preview."""
-    from shared.mesh3d import glb_read_extras, glb_to_mesh, mesh_to_glb, preview
+    """A GLB (bytes) through process_mesh: the processed GLB, keeping the source's extras, and its [C, H, W] preview. The processors
+    receive the source's OBJECT_CAMERA (object_camera)."""
+    from shared.mesh3d import glb_read_extras, glb_to_mesh, preview
 
-    mesh = process_mesh(glb_to_mesh(data), spatial_upsampling, temporal_upsampling, **kwargs)
-    return mesh_to_glb(mesh.to("cpu"), extras=glb_read_extras(data)), preview(mesh).cpu()
+    extras = glb_read_extras(data)
+    mesh = process_mesh(glb_to_mesh(data), spatial_upsampling, temporal_upsampling, object_camera=extras.get(OBJECT_CAMERA), **kwargs)
+    return _processed_glb(mesh, data, extras), preview(mesh).cpu()
+
+
+def _processed_glb(mesh, source, extras) -> bytes:
+    """The GLB of a processed mesh with the extras of its GLB source and the source pictures embedded there (they index its buffer)."""
+    from shared.mesh3d.glb import glb_add_files, glb_read_files, mesh_to_glb
+    from shared.utils.mesh_outputs import SOURCE_IMAGES_KEY
+
+    files = glb_read_files(source, SOURCE_IMAGES_KEY) if SOURCE_IMAGES_KEY in extras else {}
+    return glb_add_files(mesh_to_glb(mesh.to("cpu"), extras={key: value for key, value in extras.items() if key != SOURCE_IMAGES_KEY}), files, SOURCE_IMAGES_KEY)
 
 
 def is_mesh_file(path) -> bool:
@@ -86,9 +102,21 @@ def is_mesh_file(path) -> bool:
     return str(path).lower().endswith(MESH_EXTENSIONS) and not is_splat_file(path)
 
 
-def validate_late(spatial_upsampling, temporal_upsampling, spatial_values, temporal_values) -> str:
+def embedded_object_images(path, extract=False):
+    """The object images embedded in a gallery GLB (the Embed Source Images option): whether there are any (reading only the GLB's JSON
+    chunk), or with extract their files."""
+    if not str(path or "").lower().endswith(".glb"):
+        return [] if extract else False
+    from shared.utils.mesh_outputs import SOURCE_IMAGES_KEY, extract_mesh_source_images
+    if extract:
+        return extract_mesh_source_images(path).get("image_refs", [])
+    from shared.mesh3d import glb_read_extras
+    return bool((glb_read_extras(path).get(SOURCE_IMAGES_KEY) or {}).get("image_refs"))
+
+
+def validate_late(spatial_upsampling, temporal_upsampling, spatial_values, temporal_values, source=None) -> str:
     """Late post-processing of a gallery mesh: at least one 3D processor, and the parameters they require in that context (such as the
-    reference image, which a gallery mesh does not carry), from the slots' runtime values (parameter_ui.runtime_values)."""
+    reference image, unless the GLB source embeds its object image), from the slots' runtime values (parameter_ui.runtime_values)."""
     if not selected(spatial_upsampling, temporal_upsampling):
         return "You must choose a 3D Refiner or a Texturer"
     error = validate_processors(spatial_upsampling, temporal_upsampling)
@@ -104,17 +132,19 @@ def validate_late(spatial_upsampling, temporal_upsampling, spatial_values, tempo
     for parameter, values in checks:
         value = parameter_ui.parameter_value(parameter, values)
         if parameter.get("required", False) and (value is None or value == "" or value == []):
+            if parameter_ui.parameter_component_type(parameter) == "images" and embedded_object_images(source):
+                continue
             return f"{parameter.get('label', parameter['name'])} is required"
     return ""
 
 
 def process_file(path, spatial_upsampling, temporal_upsampling, **kwargs) -> tuple[bytes, torch.Tensor]:
     """A mesh file through process_mesh: the processed GLB (keeping a GLB source's extras) and its [C, H, W] preview."""
-    from shared.mesh3d import glb_read_extras, load_mesh, mesh_to_glb, preview
+    from shared.mesh3d import glb_read_extras, load_mesh, preview
 
-    mesh = process_mesh(load_mesh(path), spatial_upsampling, temporal_upsampling, **kwargs)
     extras = glb_read_extras(path) if str(path).lower().endswith(".glb") else {}
-    return mesh_to_glb(mesh.to("cpu"), extras=extras), preview(mesh).cpu()
+    mesh = process_mesh(load_mesh(path), spatial_upsampling, temporal_upsampling, object_camera=extras.get(OBJECT_CAMERA), **kwargs)
+    return _processed_glb(mesh, path, extras), preview(mesh).cpu()
 
 
 def reference_image(value):

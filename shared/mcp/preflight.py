@@ -21,7 +21,10 @@ def task_settings(source):
 
 
 def effective_settings(session, supplied):
+    supplied = copy.deepcopy(supplied)
     model_type = supplied.get("model_type", supplied.get("base_model_type"))
+    if session.get_model_def(model_type) is None:  # a model type merged into others (3D stage models + post-processors)
+        model_type = session._ensure_runtime().module.convert_retired_model_type(supplied)
     model_def = session.get_model_def(model_type)
     normalized = copy.deepcopy(supplied)
     apply_media_flag_defaults(normalized, model_def)
