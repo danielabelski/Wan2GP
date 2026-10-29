@@ -93,7 +93,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **More Room When RAM Runs Short**: WanGP automatically reclaims memory held by idle models to make room for the model doing the work. On Windows, it also frees cached checkpoint data left behind after loading, reducing RAM pressure when several generation and assistant models share the same PC.
 
-[![Deepy Apps showcase: The Lantern of the Moonwood, Neon Runner, Solar System Mission and Island Flyer](docs/images/deepy-apps-showcase.png)](https://wangp.ai/deepy/apps/)
+- **Custom Sigmas**: pick your own *Denoising Sigmas* for H3, LTX2 and Wan
 
 *Stories, rhythm games and 3D adventures made with Deepy. [Play all 10 demos and download their .wgpapp files](https://wangp.ai/deepy/apps/).*
 

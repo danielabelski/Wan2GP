@@ -22,7 +22,7 @@ from shared.llm_engines.lmgp import SamplingParams
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM, clear_qwen35_runtime_caches
 from shared.llm_engines.lmgp.layers.attention import reset_attention_backend_logs
 from shared.llm_engines.lmgp.utils.context import reset_context
-from shared.llm_engines.lmgp.vllm_support import TextEngine, resolve_lm_features
+from shared.llm_engines.lmgp.vllm_support import TextEngine, resolve_prompt_enhancer_lm_features
 from shared.qtypes.gguf import GGUFFirstRowsLinear, GGUFWeightTensor, materialize_module_source_tensors
 try:
     from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
@@ -709,7 +709,7 @@ def _resolve_llm_features(backend: str) -> dict:
     """What the LLM engine uses: the LM decoder optimizations the installation supports, each on its own (resolve_lm_features: CUDA
     graphs, MMGP's, the weights stay under its management; the Triton kernels: fused norms, activations, cache writes, GDN, sampling;
     FlashAttention 2), and the GGUF CUDA kernels."""
-    lm = resolve_lm_features()
+    lm = resolve_prompt_enhancer_lm_features()
     if backend == enhancer_quantization_GGUF:
         from shared.qtypes.gguf import _gguf_cuda_module
         native = _gguf_cuda_module()

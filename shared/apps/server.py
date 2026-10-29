@@ -377,8 +377,8 @@ def mount(app, public_url: str | None = None) -> None:
 
 class AppFrameGuard:
     """Refuses, on every route outside /apps/r/ and /apps/lib/, what an opaque-origin frame sends: requests with `Origin: null` (its fetches,
-    form posts and WebSockets) and cross-site no-cors loads or frame navigations. Top-level navigations from other sites and non-browser clients
-    (MCP, the CLI, scripts), which send no such headers, pass."""
+    form posts and WebSockets) and cross-site no-cors loads or frame navigations, except GET/HEAD navigations to the UI entry pages.
+    Top-level navigations from other sites and non-browser clients (MCP, the CLI, scripts), which send no such headers, pass."""
 
     def __init__(self, app):
         self.app = app
@@ -387,7 +387,10 @@ class AppFrameGuard:
         if scope["type"] in ("http", "websocket") and not scope["path"].startswith(("/apps/r/", "/apps/lib/")):
             headers = dict(scope.get("headers") or ())
             cross_site = headers.get(b"sec-fetch-site") == b"cross-site"
-            if headers.get(b"origin") == b"null" or cross_site and (headers.get(b"sec-fetch-mode") == b"no-cors" or headers.get(b"sec-fetch-dest") in (b"iframe", b"frame", b"embed", b"object")):
+            ui_navigation = (scope["type"] == "http" and scope["method"] in ("GET", "HEAD") and scope["path"] in ("/", "/deepy", "/deepy/")
+                             and headers.get(b"sec-fetch-mode") == b"navigate" and headers.get(b"sec-fetch-dest") in (b"iframe", b"frame"))
+            blocked_frame = headers.get(b"sec-fetch-dest") in (b"iframe", b"frame", b"embed", b"object") and not ui_navigation
+            if headers.get(b"origin") == b"null" or cross_site and (headers.get(b"sec-fetch-mode") == b"no-cors" or blocked_frame):
                 if scope["type"] == "websocket":
                     return await send({"type": "websocket.close", "code": 1008})
                 from starlette.responses import PlainTextResponse

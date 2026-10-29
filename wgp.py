@@ -7,6 +7,8 @@ _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepM
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
 os.environ["GRADIO_LANG"] = "en"
+# Keep Triton's existing fusion default explicit; per-kernel flags and user overrides still apply.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 # ROCm: without it, SDPA silently falls back to the math kernel on GPUs where AOTriton is still marked experimental
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 # OpenBLAS (NumPy, SciPy) commits a 32 MiB buffer per thread at import: 1.5 GB with 24 threads, unused by WanGP's PyTorch computations
@@ -45,7 +47,7 @@ from shared.cuda_memory import apply_startup_settings, write_vram_debug_report, 
 
 import time
 import threading
-from functools import partial
+from functools import partial, wraps
 from shared.utils.download_progress import DownloadCancelled, check_download_cancelled
 from shared.utils.download import DownloadError, generation_downloads
 from shared.utils.media_control import MediaProcessingAborted, controlled_model_loading, media_abort_requested
@@ -169,7 +171,8 @@ from shared.api import apply_video_length_duration, get_api_output_options, stor
 from shared.utils.side_files import process_side_files
 from shared.utils import workspace_storage
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
-from shared.llm_engines.lmgp.vllm_support import resolve_lm_features
+from shared.llm_engines.lmgp.vllm_support import resolve_lm_features, resolve_prompt_enhancer_lm_features
+resolve_prompt_enhancer_lm_features()
 from shared.gradio import assistant_chat, field_help, finetune_editor, gallery_files, local_file_picker, model_infos, model_output_filter, model_selector_toolbar, ui_studio
 from shared.gradio.magic_mask import MagicMaskUI, video_mask_area_visible, video_mask_controls_visible, video_mask_dropdown_visible
 from shared import model_dropdowns
@@ -938,20 +941,46 @@ def input_video_strength_visible(model_def, image_prompt_type, video_prompt_type
     )
 
 
-def custom_setting_visible(setting_def, video_prompt_type="", audio_prompt_type="", model_mode=None):
-    """Optional exact mode matches further restrict the existing prompt-flag conditions."""
+def custom_setting_mode_visible(setting_def, model_mode):
     if not isinstance(setting_def, dict): return False
     for key, excluded in (("model_mode", False), ("model_mode_not", True)):
         if key in setting_def:
             modes = setting_def[key]
             if not isinstance(modes, (list, tuple)): modes = [modes]
             if (model_mode in modes) == excluded: return False
+    return True
+
+
+def custom_setting_visible(setting_def, video_prompt_type="", audio_prompt_type="", model_mode=None):
+    """Optional exact mode matches further restrict the existing prompt-flag conditions."""
+    if not custom_setting_mode_visible(setting_def, model_mode): return False
     vflags, aflags = str(setting_def.get("video_prompt_type", "") or ""), str(setting_def.get("audio_prompt_type", "") or "")
     vflags_not, aflags_not = str(setting_def.get("video_prompt_type_not", "") or ""), str(setting_def.get("audio_prompt_type_not", "") or "")
     if vflags_not and any_letters(video_prompt_type or "", vflags_not): return False
     if aflags_not and any_letters(audio_prompt_type or "", aflags_not): return False
     if not (vflags or aflags): return True
     return bool(vflags and any_letters(video_prompt_type or "", vflags)) or bool(aflags and any_letters(audio_prompt_type or "", aflags))
+
+
+def compatible_custom_setting_visible(visible):
+    # Check the actual plugin wrapper once; functools.wraps can advertise the core signature.
+    signature = inspect.signature(visible, follow_wrapped=False)
+    try:
+        signature.bind(None, "", "", None)
+    except TypeError:
+        signature.bind(None, "", "")
+    else:
+        return visible
+
+    @wraps(visible)
+    def compatible(setting_def, video_prompt_type="", audio_prompt_type="", model_mode=None):
+        if not custom_setting_mode_visible(setting_def, model_mode): return False
+        # Apply mode conditions here, before a legacy wrapper forwards to core without model_mode.
+        if "model_mode" in setting_def or "model_mode_not" in setting_def:
+            setting_def = {key: value for key, value in setting_def.items() if key not in ("model_mode", "model_mode_not")}
+        return visible(setting_def, video_prompt_type, audio_prompt_type)
+
+    return compatible
 
 
 def refresh_custom_settings_visibility(state, video_prompt_type, audio_prompt_type, model_mode):
@@ -14756,7 +14785,7 @@ def get_js():
     return start_quit_timer_js, cancel_quit_timer_js, trigger_zip_download_js, trigger_settings_download_js, click_brush_js
 
 def create_ui():
-    global transformer_type
+    global transformer_type, custom_setting_visible
     if not args.lock_model:
         transformer_type = model_dropdowns.select_model_for_output_filter(_get_dropdown_deps(), server_config, transformer_type)
     gradio_downloads.install_routes()
@@ -14795,6 +14824,7 @@ def create_ui():
     js += finetune_editor.get_javascript()
     StripGallery.install_gradio_upload_mtime_patch()
     app.initialize_plugins(globals())
+    custom_setting_visible = compatible_custom_setting_visible(custom_setting_visible)
     plugin_js = ""
     if hasattr(app, "plugin_manager"):
         plugin_js = app.plugin_manager.get_custom_js()

@@ -151,6 +151,50 @@ def resolve_lm_features():
     return LMFeatures(graphs[0], triton[0], flash[0], graphs[1], triton[1], flash[1])
 
 
+@functools.cache
+def _prompt_enhancer_triton_check():
+    """Qwen's FLA kernels require block pointers, removed in Triton 3.9 despite basic kernels still working."""
+    global tl
+    import torch
+    import triton
+    import triton.language as tl
+    from tqdm import tqdm
+
+    try:
+        @triton.jit
+        def _smoke_block_pointer_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+            offset = tl.program_id(0) * BLOCK
+            source = tl.make_block_ptr(X, (N,), (1,), (0,), (BLOCK,), (0,))
+            source = tl.advance(source, (offset,))
+            target = tl.make_block_ptr(Y, (N,), (1,), (offset,), (BLOCK,), (0,))
+            value = tl.load(source, boundary_check=(0,), padding_option="zero")
+            tl.store(target, value + 1, boundary_check=(0,))
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        x = torch.arange(129, dtype=torch.float32, device=device)
+        y = torch.empty_like(x)
+        _smoke_block_pointer_kernel[(2,)](x, y, N=x.numel(), BLOCK=128)
+        torch.cuda.synchronize(device)
+        if not torch.equal(y, x + 1):
+            raise RuntimeError("incorrect output from the block-pointer kernel")
+    except Exception as exc:
+        message = str(exc).strip().splitlines()
+        reason = f"Triton {triton.__version__} block-pointer test failed: {(message[-1] if message else type(exc).__name__)[:260]}"
+        tqdm.write(f"[WARNING] {reason}. Triton kernels are disabled for Deepy and the prompt enhancer; using PyTorch kernels (slower). Reinstall the supported Triton version for your GPU/PyTorch profile from the WanGP installation guide.")
+        return False, reason
+    return True, "ok"
+
+
+def resolve_prompt_enhancer_lm_features():
+    """Apply Qwen's additional compatibility check without disabling Triton for other model families."""
+    features = resolve_lm_features()
+    if features.triton:
+        supported, reason = _prompt_enhancer_triton_check()
+        if not supported:
+            features = features._replace(triton=False, triton_reason=reason)
+    return features
+
+
 def configure_engine_kernels(model, features):
     """The kernels of the LM engine's layers in model: Triton or PyTorch ones, FlashAttention 2 or PyTorch attention, as features allow
     (CUDA graphs are decided separately)."""
