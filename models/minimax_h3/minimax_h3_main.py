@@ -163,7 +163,8 @@ def _qkv_layout(filenames, qkv_layout):
         if path.lower().endswith(".gguf"):
             return "grouped"
         with safe_open(path, "pt") as reader:
-            if (reader.metadata() or {}).get("quantization_format") or any(key.endswith((".comfy_quant", ".weight_s_rel")) for key in reader.keys()):
+            metadata = reader.metadata() or {}
+            if metadata.get("quantization_format") or metadata.get("_quantization_metadata") or any(key.endswith((".comfy_quant", ".weight_s_rel")) for key in reader.keys()):
                 return "grouped"
     return qkv_layout
 
