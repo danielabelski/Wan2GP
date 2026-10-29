@@ -528,6 +528,7 @@ def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
     if model_choice != model_type or inputs ==None:
         raise gr.Error("Webform can not be used as the App has been restarted since the form was displayed. Please refresh the page")
     
+    inputs = inputs.copy()
     inputs["state"] =  state
     inputs["model_type"] = model_type
     inputs.pop("lset_name", None)

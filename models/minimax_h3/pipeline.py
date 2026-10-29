@@ -14,11 +14,11 @@ from PIL import Image
 from tqdm import tqdm
 
 from mmgp import offload
-from shared.utils.loras_mutipliers import extract_loras_side, update_loras_slists
+from shared.utils.loras_mutipliers import extract_loras_side, parse_loras_multipliers, update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.phase_progress import control_video_encoding, generation_progress
 from shared.utils.utils import guide_mask_to_float, guide_to_float
-from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count, normalize_overlap
+from shared.utils.frame_scheduler import SLASH_BLOCK_RE, floor_frame_count, normalize_frame_count, normalize_overlap
 from shared.utils.utils import convert_video_tensor_to_uint8_chunked
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS, H3_CONTROL_LATENT_CONTINUATION,
                         H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA, h3_grouped_masking_enabled)
@@ -435,7 +435,7 @@ class MiniMaxH3Pipeline:
         return torch.device("cuda" if torch.cuda.is_available() else next(self.transformer.parameters()).device)
 
     def get_loras_transformer(self, _get_model_recursive_prop, model_type, model_def, guidance_phases, activated_loras,
-                              loras_multipliers="", transformer_loras_filenames=(), **_kwargs):
+                              loras_multipliers="", transformer_loras_filenames=(), num_inference_steps=1, prompts=(), **_kwargs):
         self._phase_2_loras = None
         if int(guidance_phases) > 1 and not model_def.get("pdd", False):
             accelerator_loras, _ = extract_loras_side(activated_loras, loras_multipliers)
@@ -451,6 +451,15 @@ class MiniMaxH3Pipeline:
             return [turbo_lora], ["0;1" if selected_vdn else "1;1"]
         if self._phase_2_loras is None:
             return [], []
+        # Window overrides can turn the accelerator off later, requiring the default again.
+        window_overrides = any("loras_mult" in match.group(1).lower() for prompt in prompts for match in SLASH_BLOCK_RE.finditer(prompt))
+        if accelerator_loras and not window_overrides:
+            _, slists, error = parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases=guidance_phases)
+            if error:
+                raise ValueError(f"Error parsing Loras: {error}")
+            if any(value != 0 for multiplier in slists["phase2"][:len(accelerator_loras)] for value in (multiplier if isinstance(multiplier, list) else [multiplier])):
+                self._phase_2_loras = None
+                return [], []
         return [model_def[H3_TURBO_LORA_KEY]], ["0;1"]
 
     def get_trans_lora(self):
