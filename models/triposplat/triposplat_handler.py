@@ -32,6 +32,7 @@ class family_handler:
         return {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_postprocessing": False,  # Gaussian splats
             "device_explicit": True,
             "dtype": "fp16",
             "image_ref_choices": {"choices": [("Object Image", "I")], "letters_filter": "I", "default": "I"},

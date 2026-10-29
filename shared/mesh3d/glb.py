@@ -199,6 +199,45 @@ def _split_glb(data) -> tuple[dict, bytes | None, int]:
     return gltf, binary, 20 + json_length
 
 
+def glb_compress_images(data: bytes, max_size: int | None = None, quality: int = 88) -> bytes:
+    """GLB whose embedded pictures are re-encoded for delivery: JPEG, or PNG when the picture uses its alpha, the longer side reduced to
+    max_size. Geometry, the other buffer views and the rest of the document are kept; pictures PIL cannot read stay as they are."""
+    import io
+
+    from PIL import Image
+
+    gltf, binary, _ = _split_glb(data)
+    images = {image["bufferView"]: index for index, image in enumerate(gltf.get("images", [])) if "bufferView" in image}
+    if binary is None or not images or any(view.get("buffer", 0) != 0 for view in gltf["bufferViews"]):
+        return bytes(data)
+    parts, size = [], 0
+    for index, view in enumerate(gltf["bufferViews"]):
+        start = view.get("byteOffset", 0)
+        chunk = bytes(binary[start:start + view["byteLength"]])
+        if index in images:
+            try:
+                with Image.open(io.BytesIO(chunk)) as picture:
+                    picture.load()
+                    alpha = "A" in picture.getbands() and picture.getchannel("A").getextrema()[0] < 255
+                    if max_size and max(picture.size) > max_size:
+                        picture.thumbnail((max_size, max_size), Image.LANCZOS)
+                    encoded = io.BytesIO()
+                    picture.save(encoded, "PNG", optimize=True) if alpha else picture.convert("RGB").save(encoded, "JPEG", quality=quality)
+                chunk = encoded.getvalue()
+                gltf["images"][images[index]]["mimeType"] = "image/png" if alpha else "image/jpeg"
+            except OSError:
+                pass
+        parts.append(bytes(-size % 4))
+        size += len(parts[-1])
+        view["byteOffset"], view["byteLength"] = size, len(chunk)
+        parts.append(chunk)
+        size += len(chunk)
+    payload = b"".join(parts)
+    payload += bytes(-len(payload) % 4)
+    gltf["buffers"][0]["byteLength"] = len(payload)
+    return _pack_glb(gltf, struct.pack("<II", len(payload), CHUNK_BIN) + payload)
+
+
 def glb_write_extras(data: bytes, extras: dict, *, merge: bool = True) -> bytes:
     """GLB with asset.extras set to extras (merged into the existing asset.extras dict when merge is True). Only the JSON
     chunk is rewritten (re-padded to 4 bytes); the following chunks, including BIN, are kept byte-identical."""

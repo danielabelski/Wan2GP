@@ -39,6 +39,7 @@ class family_handler:
         return {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_postprocessing": False,  # animated meshes
             "device_explicit": True,
             "no_negative_prompt": True,
             "embedded_guidance": False,

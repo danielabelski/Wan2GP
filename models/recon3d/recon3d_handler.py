@@ -42,6 +42,7 @@ class family_handler:
         extra_model_def = {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_postprocessing": False,  # reconstructed scenes, point clouds and splats
             "device_explicit": True,
             "no_background_removal": True,
             "fit_into_canvas_image_refs": 0,

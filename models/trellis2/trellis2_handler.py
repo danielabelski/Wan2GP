@@ -1,6 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from .prompts import TRELLIS2_DEEPY_INFOS, TRELLIS2_DEEPY_PROMPT_INFOS, TRELLIS2_INFOS, TRELLIS2_PROMPT_INFOS
-from .settings import CUSTOM_SETTINGS, MODEL_MODES
+from .settings import CUSTOM_SETTINGS, DEFAULT_CUSTOM_SETTINGS, MODEL_MODES
 
 ARCHITECTURE = "trellis2"
 REPO = "DeepBeepMeep/3D"
@@ -32,6 +32,7 @@ class family_handler:
         return {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_texture": lambda inputs: (DEFAULT_CUSTOM_SETTINGS | (inputs.get("custom_settings") or {}))["texture_mode"] != "none",
             "device_explicit": True,
             "dtype": "bf16",
             "image_ref_choices": {"choices": [("Object Image", "I")], "letters_filter": "I", "default": "I"},

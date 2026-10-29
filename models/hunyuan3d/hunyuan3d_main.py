@@ -197,6 +197,15 @@ class model_factory:
         metallic_roughness = np.stack([np.full_like(metallic, 255), roughness, metallic], axis=-1)
         return mesh.replace(uvs=uvs, base_color=torch.from_numpy(base_color).to(mesh.device), metallic_roughness=torch.from_numpy(metallic_roughness).to(mesh.device))
 
+    @generation_progress
+    @torch.inference_mode()
+    def texture_mesh(self, mesh, image, seed=0, guidance_scale=3.0, max_faces=0, texture_views="8_768", texture_size=2048, callback=None, set_progress_status=None):
+        """The Texturer entry (post-processing): PBR textures of mesh (shared.mesh3d.Mesh) painted from the object image (PIL); max_faces 0
+        keeps the mesh's faces."""
+        views, view_size = (int(value) for value in str(texture_views).split("_"))
+        mesh = Mesh(mesh.vertices.float().to(self.device), mesh.faces.to(self.device))
+        return self._texture_mesh(mesh, self._object_image(image), int(seed), float(guidance_scale), int(max_faces) or mesh.faces.shape[0], views, view_size, int(texture_size), callback)
+
     # ---------------------------------------------------------------- generation
 
     @generation_progress

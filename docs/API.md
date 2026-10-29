@@ -547,7 +547,7 @@ python -m shared.mcp --mcp-api-version 1
 
 V1 preserves historical names, schemas, defaults, results, errors and execution behavior. V2 uses compact toolbox definitions and deferred action contracts. Underlying operations are shared; aliases are normalized internally rather than advertising both syntaxes. Deepy Prime pins v2.1 independently of this external-server setting; Deepy Zero keeps its historical internal API.
 
-V2 toolboxes use progressive discovery for advanced operations: omit `action` and `arguments` to list actions; supply `action` with absent/null `arguments` to read its contract; supply an `arguments` object to execute. `{}` executes an action with defaults. Arguments without an action are rejected. Declared shortcuts and known contracts execute directly without repeated discovery. `wangp_model` actions only read the chosen model, so they run when `arguments` is omitted; its discovery lists their optional arguments. `wangp_model` additionally requires `model_type`; `wangp_postprocess` requires `media` (image/video/audio or a concrete Gallery ID/authorized path). Post-processing execution requires concrete media. A contract read for a concrete image or video gives each upscaler's `approximate_output_dimensions` per multiplier; spatial and temporal treatments of a video copy its soundtracks and text subtitle tracks. Deepy Prime and external v2.1 expose `remux_media` in place of `replace_audio`: pass `audio_ids` and optionally `video_id`. One audio input plus a video replaces its soundtrack; multiple inputs mix by default. `mode="multitrack"` retains separate selectable streams. To add selectable subtitles, pass `video_id` and `subtitle_tracks`, each with an authorized SRT/VTT/ASS/SSA file `path` and optional ISO 639 `language`, `title`, and `default`. With no `audio_ids`, existing audio streams are copied when compatible with the output container; incompatible streams use the configured video audio codec. Existing video subtitles are retained by default; `include_video_subtitles=false` removes them. MP4/MOV use `mov_text`; MKV copies compatible subtitle streams or converts unsupported ones. Audio-only mixes use the configured standalone WAV or MP3 format by default. When requested, `output_extension` can select WAV, MP3, FLAC or M4A for a mix, or MP4, MOV or MKV for a video output. Audio-only multitrack files use M4A because WAV and MP3 cannot hold separate streams. M4A copies AAC/ALAC streams and converts other streams to lossless ALAC; multitrack video uses MKV and copies audio streams. Video soundtrack replacement copies compatible audio streams and otherwise uses the configured video audio codec. Mixing re-encodes the combined result. External MCP V1 and V2 retain `replace_audio`.
+V2 toolboxes use progressive discovery for advanced operations: omit `action` and `arguments` to list actions; supply `action` with absent/null `arguments` to read its contract; supply an `arguments` object to execute. `{}` executes an action with defaults. Arguments without an action are rejected. Declared shortcuts and known contracts execute directly without repeated discovery. `wangp_model` actions only read the chosen model, so they run when `arguments` is omitted; its discovery lists their optional arguments. `wangp_model` additionally requires `model_type`; `wangp_postprocess` requires `media` (image/video/audio/3d or a concrete Gallery ID/authorized path; meshes take the 3D Refiner and Texturer, Gaussian splats have no treatment). Post-processing execution requires concrete media. A contract read for a concrete image or video gives each upscaler's `approximate_output_dimensions` per multiplier; spatial and temporal treatments of a video copy its soundtracks and text subtitle tracks. Deepy Prime and external v2.1 expose `remux_media` in place of `replace_audio`: pass `audio_ids` and optionally `video_id`. One audio input plus a video replaces its soundtrack; multiple inputs mix by default. `mode="multitrack"` retains separate selectable streams. To add selectable subtitles, pass `video_id` and `subtitle_tracks`, each with an authorized SRT/VTT/ASS/SSA file `path` and optional ISO 639 `language`, `title`, and `default`. With no `audio_ids`, existing audio streams are copied when compatible with the output container; incompatible streams use the configured video audio codec. Existing video subtitles are retained by default; `include_video_subtitles=false` removes them. MP4/MOV use `mov_text`; MKV copies compatible subtitle streams or converts unsupported ones. Audio-only mixes use the configured standalone WAV or MP3 format by default. When requested, `output_extension` can select WAV, MP3, FLAC or M4A for a mix, or MP4, MOV or MKV for a video output. Audio-only multitrack files use M4A because WAV and MP3 cannot hold separate streams. M4A copies AAC/ALAC streams and converts other streams to lossless ALAC; multitrack video uses MKV and copies audio streams. Video soundtrack replacement copies compatible audio streams and otherwise uses the configured video audio codec. Mixing re-encodes the combined result. External MCP V1 and V2 retain `replace_audio`.
 
 For a named model, use `wangp_models(query="SenseNova")` directly. The case-insensitive substring search covers name, ID, family and description; it needs no wildcard. Omit all arguments for discovery. For advanced filters, use `action="search", arguments={"query":"SenseNova","filters":{"main_output":"image"}}`; do not combine the shortcut with action/arguments. String filters match whole values, with optional `*` and `?` globs. An incomplete shortcut result includes a `next_call` recipe for continuation. Results name each model's specialities; `action="specialities"` lists their aliases. `templates` lists the ready-made recipes built on a model as `task: template`, marked `(default)` for a task's default; read one with `wangp_templates(task=..., template=...)`.
 
@@ -869,13 +869,13 @@ Convenience helpers are available for the common edit task shapes:
 
 #### Image And Video Postprocessing
 
-`submit_media_postprocessing(...)` accepts one media source plus any combination of temporal upsampling, spatial upsampling, and film grain:
+`submit_media_postprocessing(...)` accepts one media source plus any combination of temporal upsampling, spatial upsampling, and film grain. Meshes take a 3D Refiner (`spatial_upsampling`) and a Texturer (`temporal_upsampling`):
 
 ```python
 job = session.submit_media_postprocessing(
     r"C:\media\input.mp4",
     spatial_upsampling="h3facerefine",
-    spatial_upsampler_param=2,
+    spatial_postprocessing_parameters={"face_count": 2},
     return_media=True,
 )
 
@@ -885,9 +885,10 @@ print(result.generated_files)
 
 Postprocessing values use the registered postprocessor value strings:
 
-- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4`. Temporal upsampling is video-only.
+- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4` for videos, or texturers such as `supratex` for meshes.
 - `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiner `h3facerefine`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
-- Method-specific values use the flat parameter ids returned by postprocessing discovery. For example, H3 accepts `spatial_upsampler_prompt`, `spatial_upsampler_reference_images`, and `spatial_upsampler_param`.
+- `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters`: the options of the spatial and of the temporal processor, each a dictionary keyed by the parameter ids returned by postprocessing discovery. For example, H3 accepts `prompt`, `face_count` and `face_strength`; the texturers accept `texture_size` and `texture_max_faces`.
+- `postprocessing_reference_images`: the reference images shared by both processors: H3's face references, or the object image of Hi3D and the texturers (their `reference_images` parameter).
 - `film_grain_intensity` / `film_grain_saturation`: late film grain settings. Film grain is active when intensity is greater than `0`.
 
 At least one postprocessing operation must be selected.
@@ -954,8 +955,6 @@ settings = {
     "video_source": r"C:\media\input.mp4",
     "temporal_upsampling": "rife*4",
     "spatial_upsampling": "lanczos*2",
-    "spatial_upsampler_param": 1,
-    "spatial_upsampler_param2": 1,
     "_api": {"return_media": True},
 }
 
@@ -966,7 +965,7 @@ Raw task modes:
 
 | Mode | Source field | Processor fields |
 | --- | --- | --- |
-| `edit_postprocessing` | `video_source` | `temporal_upsampling`, `spatial_upsampling`, flat `spatial_upsampler_*` method parameters, `film_grain_intensity`, `film_grain_saturation` |
+| `edit_postprocessing` | `video_source` | `temporal_upsampling`, `spatial_upsampling`, `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters` (each processor's options by id), `postprocessing_reference_images`, `film_grain_intensity`, `film_grain_saturation` |
 | `edit_remux` | `video_source` | `postprocess_audio`, `audio_source`, `postprocess_audio_prompt`, `postprocess_audio_neg_prompt`, `replace_voice_sample`, `replace_voice_sample2` |
 | `edit_audio` | `audio_source` | `postprocess_audio`, `replace_voice_sample`, `replace_voice_sample2` |
 

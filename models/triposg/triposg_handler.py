@@ -58,6 +58,7 @@ class family_handler:
             return {
                 "image_outputs": True,
                 "mesh_outputs": True,
+                "mesh_postprocessing": False,  # segmented meshes: their parts would merge
                 "device_explicit": True,
                 "image_prompt_types_allowed": "",
                 "prompt_description": "Asset Name / Description (optional, used for file names)",
@@ -81,6 +82,7 @@ class family_handler:
             }
         parts = base_model_type == PARTCRAFTER_ARCH
         return {
+            "mesh_postprocessing": not parts,  # PartCrafter's parts would merge
             "image_outputs": True,
             "mesh_outputs": True,
             "device_explicit": True,

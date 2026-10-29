@@ -36,9 +36,10 @@ Model links below select a model when this guide is opened inside WanGP. When re
 | Songs with lyrics | [YuE2](modeltype:yue2), [MiniMax Music 3](modeltype:minimax_music3), [ACE-Step 1.5 XL](modeltype:ace_step_v1_5_xl) | YuE2 adds composition, cover and score workflows. MiniMax Music 3 generates songs from lyrics and a description. ACE-Step offers fast music generation with optional planning models. |
 | A song from a hummed melody | [YuE2 Hum-to-Song](modeltype:yue2_hum) | Supply a clear hum, your lyrics and a musical style. It follows the melody, not the humming voice's identity. |
 | Instrumentals, ambience and sound effects | [Stable Audio 3](modeltype:stable_audio3_small), [YuE2](modeltype:yue2) in instrumental mode | Stable Audio covers descriptive sound and music prompts; YuE2 supports structured instrumental composition. |
-| A textured 3D asset from one image | [TRELLIS.2](modeltype:trellis2), [Hunyuan3D 2.1](modeltype:hunyuan3d_21) | Both create meshes with PBR materials. Hunyuan3D can also texture a mesh you already have. |
+| A textured 3D asset from one image | [TRELLIS.2](modeltype:trellis2), [Hunyuan3D 2.1](modeltype:hunyuan3d_21), [SUPRA-Tex](modeltype:supratex) | All create meshes with PBR materials. SUPRA-Tex keeps the picture's colours and print exactly on the visible side; Hunyuan3D and SUPRA-Tex can also texture a mesh you already have. |
 | An untextured mesh or separate object parts | [TripoSG](modeltype:triposg), [PartCrafter](modeltype:partcrafter) | TripoSG produces one detailed shape; PartCrafter generates separate part meshes from the same image. |
 | A 3D scene from photos or video | [WorldMirror 2.0](modeltype:worldmirror_2), [MapAnything](modeltype:mapanything), [Depth Anything 3 Points](modeltype:da3_points) | Use overlapping views of a static scene. Choose Gaussian splats for viewing or point clouds with camera information for further work. |
+| Add fine detail to a coarse mesh | [Hi3D](modeltype:hi3d) | Refines a Hunyuan3D, TripoSG or TRELLIS.2 shape into high-resolution geometry from the same picture; texture it afterwards with Hunyuan3D or SUPRA-Tex, or chain all three in post-processing. |
 | Split or animate an existing mesh | [GeoSAM2](modeltype:geosam2), [AnimateAnyMesh](modeltype:animate_any_mesh) | GeoSAM2 separates parts; AnimateAnyMesh creates a short animation from a motion description without a rig. |
 
 <a id="video-models"></a>
@@ -244,6 +245,7 @@ WanGP supports creating objects from images, reconstructing scenes from photos o
 | **[Hunyuan3D 2.1](modeltype:hunyuan3d_21)** | Generate **Shape + PBR Texture**, generate **Shape Only**, or **Texture a Mesh** to paint a supplied mesh from the reference image. The separate [Shape model](modeltype:hunyuan3d_21_shape) produces geometry only. Texturing replaces the mesh's existing UVs and materials. |
 | **[TripoSG](modeltype:triposg)** | A detailed, untextured GLB mesh. Useful when you want to edit the shape or texture it separately. Higher mesh resolution preserves finer detail but increases extraction time and face count. |
 | **[PartCrafter](modeltype:partcrafter)** | A GLB containing separate, untextured part meshes generated together. Choose the number of parts to suit the object. Parts can be moved or edited individually, but their order and colours are arbitrary and small parts may overlap or be missing. |
+| **[SUPRA-Tex](modeltype:supratex)** | A GLB mesh with PBR textures that keep the picture's colours, print and patterns on the side the picture shows, the hidden side completed to match. Its geometry comes from **Pixal3D**, built in the picture's own camera so that the mesh fits the image exactly. **Shape Only** and **Texture a Mesh** modes are available; the [Pixal3D Shape](modeltype:pixal3d) model gives the geometry alone and the [SUPRA-Tex Texturer](modeltype:supratex_texture) the texturing alone. It reuses Qwen Image 2.1 to read the picture's materials, which is for **non-commercial use only** (Qwen Research License). |
 | **[TripoSplat](modeltype:triposplat)** | A Gaussian-splat PLY for viewing objects with fine, fuzzy or thin details. It produces splats rather than an editable mesh, so choose another model for mesh texturing or rigging. |
 
 Use one whole, uncropped object on a plain or transparent background, preferably in a three-quarter view with even lighting. Hidden sides are inferred and may differ from the real object. For these models, **Asset Name / Description** names the output; the reference image determines its appearance. To start from text, generate an image first, then use it as the 3D reference.
@@ -259,14 +261,25 @@ Use one whole, uncropped object on a plain or transparent background, preferably
 
 Sharp, overlapping views with a moving camera and a static scene work best. Moving subjects, reflections and textureless surfaces are harder to reconstruct. More views and higher working resolution increase memory use and processing time. The text field names the scene; it does not alter the reconstruction.
 
-### Split and animate existing meshes
+### Refine, split and animate existing meshes
+
+- **[Hi3D](modeltype:hi3d)** refines a coarse mesh into high-resolution geometry from a picture of the same object: seams, buttons, scales and engravings that image-to-3D models only suggest. Use the **To Input Mesh** button of a Hunyuan3D Shape, TripoSG or TRELLIS.2 result together with its picture. **1024** gives a strong improvement in a few minutes on a fast GPU; **512** is quicker and **1536** adds the finest relief for about twice the time of 1024. The result keeps the input's position and scale but has no textures: texture it afterwards with Hunyuan3D 2.1 or SUPRA-Tex **Texture a Mesh**, keeping enough faces that the detail survives. Hi3D keeps the overall shape, so fix missing or merged parts in the coarse mesh first.
+
+#### 3D post-processing: refine and texture in one go
+
+The **Post Processing** tab of untextured mesh models (Hunyuan3D Shape, TripoSG, TRELLIS.2 in shape mode, Pixal3D) offers two 3D steps, run on each generated mesh with the generation's object image:
+
+- **3D Refiner** (Hi3D): adds fine geometric detail first.
+- **Texturer** (SUPRA-Tex or Hunyuan3D 2.1 Paint): then paints PBR textures. SUPRA-Tex keeps the picture's colours and print on the visible side; Hunyuan3D Paint paints all around from generated views and tolerates a mesh that differs more from the picture.
+
+Combining them gives a shape, its fine relief and its textures in one generation. A model that already textures its meshes cannot take a Texturer, and a textured mesh cannot be refined (refining replaces the geometry and drops its textures). In late post-processing, select a mesh in the gallery and add its **Object Image**: one field, used by both steps. SUPRA-Tex places the mesh from the picture's silhouette, so the picture must show the same object; regions the picture does not show are completed and can come out plainer than the visible side.
 
 - **[GeoSAM2](modeltype:geosam2)** splits an input mesh into separate parts within one GLB. Use automatic segmentation or optional point prompts to guide it. Existing textures are retained; small or hidden parts can be merged.
 - **[AnimateAnyMesh](modeltype:animate_any_mesh)** animates an input mesh from an English motion description, such as `The dragon flaps its wings and flies`. It needs no skeleton or rig and retains the mesh's textures. Motion is limited to 16 generated frames, with an optional forward-and-backward loop. It deforms the existing shape, so it cannot split a closed mesh into new pieces. Start with an upright mesh and try a few seeds.
 
 ### Reuse 3D assets
 
-Open results in the **3D gallery** to rotate, zoom and inspect them. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, segmentation or animation. [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
+Open results in the **3D gallery** to rotate, zoom and inspect them. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, refinement, segmentation or animation: select one in the 3D gallery and press **To Input Mesh**, shown for models that take a mesh. For models with a **Texture a Mesh** mode (SUPRA-Tex, Hunyuan3D 2.1), the button also selects that mode. [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
 
 ## Upscaling and finishing
 

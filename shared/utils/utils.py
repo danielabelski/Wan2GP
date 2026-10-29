@@ -21,7 +21,7 @@ from functools import lru_cache
 from . import files_locator as fl
 from .video_decode import probe_video_stream_metadata, decode_video_frames_ffmpeg, get_video_summary_extras
 from .virtual_media import get_virtual_image, parse_virtual_media_path, strip_virtual_media_suffix
-from .gallery_sources import MESH_EXTENSIONS, MESH_IMPORT_EXTENSIONS, WORLD_EXTENSIONS
+from .gallery_sources import APP_EXTENSIONS, MESH_EXTENSIONS, MESH_IMPORT_EXTENSIONS, WORLD_EXTENSIONS
 
 
 from PIL import Image
@@ -57,10 +57,13 @@ def has_mesh_file_extension(filename):
 def has_world_file_extension(filename):
     return os.path.splitext(strip_virtual_media_suffix(filename))[-1].lower() in WORLD_EXTENSIONS
 
+def has_app_file_extension(filename):
+    return os.path.splitext(strip_virtual_media_suffix(filename))[-1].lower() in APP_EXTENSIONS
+
 def get_media_kind(filename):
-    """"image", "video", "audio", "3d", "world" or None, from the file extension."""
+    """"image", "video", "audio", "3d", "world", "app" or None, from the file extension."""
     for kind, test in (("video", has_video_file_extension), ("image", has_image_file_extension), ("audio", has_audio_file_extension), ("3d", has_mesh_file_extension),
-                       ("world", has_world_file_extension)):
+                       ("world", has_world_file_extension), ("app", has_app_file_extension)):
         if test(filename):
             return kind
     return None

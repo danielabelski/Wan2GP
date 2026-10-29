@@ -16,20 +16,23 @@ TEXTURE_VIEWS = [("6 Views at 512 px (fast)", "6_512"), ("8 Views at 768 px", "8
 
 
 def _custom_settings(textured):
+    # the Mode of the PBR model: Texture a Mesh generates no shape, Shape Only paints no texture
     settings = [
         {"id": "octree_resolution", "name": "Mesh Resolution", "label": "Mesh Resolution (surface grid)", "type": "dropdown", "default": 256,
          "choices": [("196 (Fast)", 196), ("256 (Standard)", 256), ("384 (High)", 384), ("512 (Very High)", 512)],
-         "info": "Resolution of the grid the surface is extracted from: higher values keep finer details and give more faces."},
-        {"id": "max_faces", "name": "Max Faces", "label": "Max Faces (0 = keep all)" if not textured else "Max Faces (textured meshes, 0 = 40000)",
+         "info": "Resolution of the grid the surface is extracted from: higher values keep finer details and give more faces.",
+         **({"model_mode_not": ["texture"]} if textured else {})},
+        {"id": "max_faces", "name": "Max Faces", "label": "Max Faces (0 = keep all)" if not textured else "Max Faces (0 = 40000 when textured, all in Shape Only)",
          "type": "int", "min": 0, "max": 1000000, "inc": 1000, "default": 40000 if textured else 0,
          "info": "Reduces the mesh to this number of faces (quadric decimation)."},
     ]
     if textured:
         settings += [
             {"id": "texture_views", "name": "Texture Views", "label": "Texture Views", "type": "dropdown", "default": "8_768", "choices": TEXTURE_VIEWS,
-             "info": "Views generated to paint the texture: more views and 768 px cover the object better and look sharper, 6 at 512 px is faster."},
+             "info": "Views generated to paint the texture: more views and 768 px cover the object better and look sharper, 6 at 512 px is faster.",
+             "model_mode_not": ["shape"]},
             {"id": "texture_size", "name": "Texture Size", "label": "Texture Size", "type": "dropdown", "default": 2048,
-             "choices": [("1024", 1024), ("2048", 2048), ("4096", 4096)], "info": "Size of the PBR texture images."},
+             "choices": [("1024", 1024), ("2048", 2048), ("4096", 4096)], "info": "Size of the PBR texture images.", "model_mode_not": ["shape"]},
         ]
     return settings
 
@@ -61,6 +64,7 @@ class family_handler:
         extra_model_def = {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_texture": (lambda inputs: inputs.get("model_mode") != "shape") if textured else False,  # Shape Only leaves the mesh untextured
             "device_explicit": True,
             "dtype": "fp16",
             "image_ref_choices": {"choices": [("Object Image", "I")], "letters_filter": "I", "default": "I"},
@@ -91,7 +95,7 @@ class family_handler:
                 "model_modes": {"choices": MODES, "default": "shape_texture", "label": "Mode"},
                 "alt_guidance": "Texture Guidance",
                 "custom_guide": {"id": "custom_guide", "name": "Mesh", "label": "Input Mesh (Texture a Mesh)", "type": "file",
-                                 "default": None, "required": False, "file_types": MESH_FILE_TYPES},
+                                 "default": None, "required": True, "file_types": MESH_FILE_TYPES, "model_mode": ["texture"]},
             })
             extra_model_def["specialities"].append({"name": "PBR texturing", "aliases": ["textured mesh", "texture a mesh", "retexture"],
                                                     "description": "Paints a generated or supplied mesh with base colour and metallic-roughness textures matching a picture."})

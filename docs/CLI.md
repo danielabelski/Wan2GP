@@ -235,6 +235,12 @@ Pinned ("reserved") RAM makes the transfers to the GPU fast, but nothing else ca
 
 When the models do not all fit in it, WanGP reserves first the parts used at every step; with [Smart Memory Pinning](#smart-memory-pinning), the rest still reaches the GPU almost as fast, so a smaller share mostly costs speed on short steps.
 
+### Trying a Smaller GPU
+```bash
+--max-vram 8   # WanGP behaves as on a GPU with 8 GB of VRAM
+```
+`--max-vram GB` makes WanGP behave as it would on a GPU with that much VRAM: memory profiles, preloads, VAE tiling and Deepy's choices follow that card, and WanGP uses at most GB - 1.2 GB of VRAM (a real card leaves about that much to the driver and the desktop). Use it to check that settings or a workflow fit a smaller GPU before sharing them. The VRAM other programs use on your GPU does not count, unless they leave less than the emulated card would: then WanGP has only what is really free. The speed stays that of your GPU.
+
 ### VRAM Allocator
 ```bash
 --vram-allocator vmm_spill  # MMGP Optimized VRAM Allocator with RAM spilling (default)

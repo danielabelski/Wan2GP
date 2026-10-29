@@ -105,6 +105,8 @@ DEEPY_FILE_SYSTEM_PATHS_DEFAULT: list[str] = []
 DEEPY_READ_EVERYWHERE_DEFAULT = False
 DEEPY_PYTHON_SANDBOX_KEY = "deepy_python_sandbox"
 DEEPY_PYTHON_SANDBOX_DEFAULT = "enabled"
+PYTHON_APPS_KEY = "python_apps"  # shared config group of App Development (Advanced): {"development": "off" | "apps" | "plugins"}
+PYTHON_APPS_LEVELS = ("off", "apps", "plugins")
 DEEPY_WEB_SEARCH_KEY = "deepy_web_search"
 DEEPY_WEB_SEARCH_DEFAULT = "disabled"
 CIVITAI_API_KEY_KEY = "civitai_api_key"  # shared config: Civitai downloads of LoRAs through Deepy's web toolbox (searching needs none); plaintext only when not stored securely
@@ -488,6 +490,20 @@ def normalize_deepy_python_sandbox(value: Any) -> str:
     if isinstance(value, bool):
         return "enabled" if value else "disabled"
     return "disabled" if str(value or "").strip().lower() in {"disabled", "off", "false", "0", "no"} else "enabled"
+
+
+def normalize_python_apps(value: Any) -> dict[str, Any]:
+    group = dict(value) if isinstance(value, dict) else {}
+    level = str(group.get("development") or "off").strip().lower()
+    group["development"] = level if level in PYTHON_APPS_LEVELS else "off"
+    return group
+
+
+def python_apps_level() -> str:
+    """App Development (Advanced): "off", "apps" (web apps) or "plugins"; always "off" while the Python sandbox is disabled."""
+    if normalize_deepy_python_sandbox(get_deepy_config_value(DEEPY_PYTHON_SANDBOX_KEY, DEEPY_PYTHON_SANDBOX_DEFAULT)) != "enabled":
+        return "off"
+    return normalize_python_apps(get_deepy_config_value(PYTHON_APPS_KEY))["development"]
 
 
 def normalize_deepy_web_search(value: Any) -> str:

@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import functools
 import os
@@ -186,6 +187,7 @@ class TextEngine:
         self._max_num_seqs_hint = None
         self._max_num_batched_tokens_hint = None
         self._last_failure_reason = ""
+        self._disposable = None  # its runtime (KV cache, graphs, state) declared to MMGP as disposable (mmgp.runtime.disposable)
 
     @staticmethod
     def _compute_runtime_hints(prompt_len: int, max_tokens: int, cfg_scale: float, num_seqs: int = 1):
@@ -221,7 +223,7 @@ class TextEngine:
         self._max_model_len_hint = max_model_len
         self._max_num_seqs_hint = max_num_seqs
         self._max_num_batched_tokens_hint = max_num_batched_tokens
-        self.close()
+        self.close()  # made again larger
 
     def reserve_runtime(self, prompt_len: int, max_tokens: int, cfg_scale: float, num_seqs: int = 1, min_model_len: int | None = None):
         req_model_len, req_num_seqs, req_num_batched = self._compute_runtime_hints(
@@ -275,6 +277,26 @@ class TextEngine:
             **self._kv_cache_options,
         )
         self._sampling_params_cls = SamplingParams
+        from mmgp import runtime
+        # MMGP takes it back only when VRAM runs short while the engine is not in use (its model parked, or idle()): after the blocks of the
+        # idle models; the owner of a live context saves it first (close)
+        self._disposable = runtime.disposable(self.model, "the language model's KV cache", self.close)
+
+    def has_live_context(self) -> bool:
+        """A sequence kept between requests (an assistant's conversation): other requests run beside it (LLMEngine.aside)."""
+        scheduler = None if self._llm is None else self._llm.scheduler
+        return scheduler is not None and bool(scheduler.running or scheduler.waiting)
+
+    def idle(self):
+        """A scope in which the caller's thread runs other models and the engine is not used: MMGP may release its runtime if VRAM runs short."""
+        return contextlib.nullcontext() if self._disposable is None else self._disposable.idle()
+
+    def save_context(self) -> None:
+        """Before the live context goes (the engine closed, or a request run as alone): its owner, while away (the model's
+        _lm_engine_context_saver, e.g. Deepy parked), saves it to RAM, to restore it at its next use."""
+        saver = getattr(self.model, "_lm_engine_context_saver", None)
+        if saver is not None and self.has_live_context():
+            saver()
 
     def release_runtime_allocations(self):
         if self._llm is None:
@@ -291,6 +313,15 @@ class TextEngine:
         return not enforce_eager
 
     def close(self):
+        try:
+            self.save_context()  # the live context of an owner away (Deepy parked) goes to RAM first
+        finally:
+            self._close()
+
+    def _close(self):
+        disposable, self._disposable = getattr(self, "_disposable", None), None
+        if disposable is not None:
+            disposable.close()
         llm = getattr(self, "_llm", None)
         self._llm = None
         if llm is not None:

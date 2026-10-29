@@ -13,7 +13,7 @@ CUSTOM_SETTINGS = [
     {"id": "texture_size", "label": "Texture Size", "name": "Texture Size", "type": "dropdown", "default": 2048,
      "choices": [("1024", 1024), ("2048", 2048), ("4096", 4096)]},
     {"id": "max_tokens", "label": "Max Tokens of the 1536 Cascade (lowers its resolution by steps of 128 above it)", "name": "Max Tokens",
-     "type": "int", "default": 49152, "min": 16384, "max": 98304, "inc": 4096},
+     "type": "int", "default": 49152, "min": 16384, "max": 98304, "inc": 4096, "model_mode": [3]},
     {"id": "alpha_mode", "label": "Transparency", "name": "Transparency", "type": "dropdown", "default": "opaque",
      "choices": [("Opaque (Alpha Ignored, as the Official Exporter)", "opaque"), ("Alpha Blending (Glass, Thin Materials)", "blend")]},
 ]
